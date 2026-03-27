@@ -603,8 +603,11 @@ func (n *Node) Close() error {
 		}
 		if werr := n.wal.Close(); werr != nil {
 			logrus.Errorf("strata: wal close: %v", werr)
+			err = werr
 		}
-		err = n.db.Close()
+		if dberr := n.db.Close(); dberr != nil {
+			err = dberr
+		}
 	})
 	return err
 }

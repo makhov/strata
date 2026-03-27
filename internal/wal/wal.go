@@ -262,10 +262,14 @@ func (w *WAL) Close() error {
 	// Upload the final segment synchronously before cancelling the upload loop
 	// so a replacement node can recover all acknowledged writes from object
 	// storage. The upload loop is still running at this point.
+	var uploadErr error
 	if finalSeg != nil && w.uploader != nil {
 		objKey := ObjectKey(finalSeg.Term(), finalSeg.FirstRev())
-		if err := w.uploader(context.Background(), finalSeg.Path(), objKey); err != nil {
-			logrus.Errorf("wal: close upload final segment: %v", err)
+		uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		uploadErr = w.uploader(uploadCtx, finalSeg.Path(), objKey)
+		uploadCancel()
+		if uploadErr != nil {
+			logrus.Errorf("wal: close upload final segment: %v", uploadErr)
 		}
 	}
 
@@ -273,7 +277,7 @@ func (w *WAL) Close() error {
 		w.cancelLoops()
 	}
 	w.wg.Wait()
-	return nil
+	return uploadErr
 }
 
 // SealAndFlush seals the active segment immediately (blocking) and queues it
