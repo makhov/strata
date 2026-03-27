@@ -88,18 +88,26 @@ func Write(ctx context.Context, db *pebble.DB, store object.Store, term uint64, 
 		return fmt.Errorf("checkpoint: pebble checkpoint: %w", err)
 	}
 
-	objKey := CheckpointKey(term, revision)
-	pr, pw := io.Pipe()
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- writeArchive(pw, term, revision, cpDir)
-		pw.Close()
-	}()
-	if err := store.Put(ctx, objKey, pr); err != nil {
-		return fmt.Errorf("checkpoint: upload %q: %w", objKey, err)
+	// Write the archive to a temp file before uploading. An *os.File is
+	// seekable, which lets the AWS SDK rewind and retry failed PutObject
+	// requests. An io.Pipe reader is not seekable and causes
+	// "request stream is not seekable" on any retry attempt.
+	archivePath := filepath.Join(tmpDir, "archive")
+	f, err := os.Create(archivePath)
+	if err != nil {
+		return fmt.Errorf("checkpoint: create archive: %w", err)
 	}
-	if archErr := <-errCh; archErr != nil {
-		return archErr
+	defer f.Close()
+	if err := writeArchive(f, term, revision, cpDir); err != nil {
+		return fmt.Errorf("checkpoint: write archive: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("checkpoint: seek archive: %w", err)
+	}
+
+	objKey := CheckpointKey(term, revision)
+	if err := store.Put(ctx, objKey, f); err != nil {
+		return fmt.Errorf("checkpoint: upload %q: %w", objKey, err)
 	}
 
 	m := &Manifest{
