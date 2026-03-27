@@ -6,7 +6,7 @@ import (
 
 	"google.golang.org/grpc/credentials"
 
-	"github.com/makhov/strata/internal/object"
+	"github.com/makhov/strata/pkg/object"
 )
 
 // Config holds all configuration for a Node.

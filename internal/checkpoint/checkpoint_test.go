@@ -12,7 +12,7 @@ import (
 	"github.com/cockroachdb/pebble"
 
 	"github.com/makhov/strata/internal/checkpoint"
-	"github.com/makhov/strata/internal/object"
+	"github.com/makhov/strata/pkg/object"
 )
 
 // openDB opens a pebble DB in a temp directory.

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/makhov/strata"
-	"github.com/makhov/strata/internal/object"
+	"github.com/makhov/strata/pkg/object"
 )
 
 // openNode starts a Node with an in-memory object store and a temp data dir.

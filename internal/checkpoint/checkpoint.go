@@ -15,7 +15,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/makhov/strata/internal/object"
+	"github.com/makhov/strata/pkg/object"
 )
 
 // Manifest is stored at "manifest/latest" in object storage.

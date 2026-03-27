@@ -41,7 +41,7 @@ for e := range events {
 import (
     awsconfig "github.com/aws/aws-sdk-go-v2/config"
     "github.com/aws/aws-sdk-go-v2/service/s3"
-    "github.com/makhov/strata/internal/object"
+    "github.com/makhov/strata/pkg/object"
 )
 
 awsCfg, _ := awsconfig.LoadDefaultConfig(ctx)

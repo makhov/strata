@@ -19,10 +19,10 @@ import (
 	"github.com/makhov/strata/internal/checkpoint"
 	"github.com/makhov/strata/internal/election"
 	"github.com/makhov/strata/internal/metrics"
-	"github.com/makhov/strata/internal/object"
 	"github.com/makhov/strata/internal/peer"
 	istore "github.com/makhov/strata/internal/store"
 	"github.com/makhov/strata/internal/wal"
+	"github.com/makhov/strata/pkg/object"
 )
 
 // Sentinel errors.

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/makhov/strata"
-	"github.com/makhov/strata/internal/object"
+	"github.com/makhov/strata/pkg/object"
 )
 
 // freeAddrImpl allocates a random TCP port and releases it.

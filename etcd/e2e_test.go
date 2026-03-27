@@ -13,7 +13,7 @@ import (
 
 	"github.com/makhov/strata"
 	strataetcd "github.com/makhov/strata/etcd"
-	"github.com/makhov/strata/internal/object"
+	"github.com/makhov/strata/pkg/object"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
