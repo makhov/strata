@@ -1,20 +1,19 @@
 # Strata
 
-Strata is an embeddable, S3-durable key-value store with etcd-compatible semantics. It is designed to run either as a library inside your Go program or as a standalone binary serving the [kine](https://github.com/k3s-io/kine) wire protocol (which makes it a drop-in etcd replacement for Kubernetes).
+Strata is an embeddable, S3-durable key-value store. It is designed to be used as a library inside your Go program, with an optional standalone binary for deployments that need a separate process.
 
 Key properties:
 
 - **Embedded-first** — `strata.Open(cfg)` is the entire API surface; no separate process needed.
 - **S3-durable** — WAL segments and periodic Pebble snapshots are uploaded to S3 (or any S3-compatible store). A node that loses its disk recovers automatically.
 - **Multi-node** — A leader is elected via an S3 lock. Followers stream the WAL from the leader in real time and transparently forward writes. Leader election is driven by stream liveness, not heartbeat polling.
-- **etcd-compatible** — A thin kine adapter makes Strata usable as a Kubernetes datastore without any changes to Kubernetes or kine.
 
 ---
 
 ## Contents
 
 1. [Embedded usage](#embedded-usage)
-2. [Standalone CLI (kine endpoint)](#standalone-cli)
+2. [Standalone CLI](#standalone-cli)
 3. [Single-node quickstart](#single-node-quickstart)
 4. [Multi-node setup](#multi-node-setup)
 5. [mTLS between peers](#mtls-between-peers)
@@ -39,7 +38,7 @@ if err != nil {
 defer node.Close()
 
 // Write
-rev, err := node.Put(ctx, "/config/timeout", []byte("30s"), 0)b
+rev, err := node.Put(ctx, "/config/timeout", []byte("30s"), 0)
 
 // Read
 kv, err := node.Get("/config/timeout")
@@ -85,7 +84,7 @@ With an object store configured, Strata:
 
 ## Standalone CLI
 
-The `strata` binary exposes a node as a kine gRPC endpoint that Kubernetes (or any other kine client) connects to.
+The `strata` binary runs a node as a standalone process and exposes the **etcd v3 gRPC protocol** on `--listen`. Any etcd v3 client — `etcdctl`, the official `go.etcd.io/etcd/client/v3` Go package, Kubernetes, or anything else that speaks etcd — works against it without modification.
 
 ```
 go install github.com/makhov/strata/cmd/strata@latest
@@ -101,7 +100,14 @@ strata \
   --listen   0.0.0.0:2379
 ```
 
-That's it. No S3, no peers — pure local durability. Suitable for development or single-node clusters where local disk loss is acceptable.
+No S3, no peers — pure local durability. Suitable for development or deployments where local disk loss is acceptable.
+
+Verify with `etcdctl`:
+
+```bash
+etcdctl --endpoints=localhost:2379 put /hello world
+etcdctl --endpoints=localhost:2379 get /hello
+```
 
 ### With S3
 
@@ -169,13 +175,13 @@ strata \
 
 ### How leader election works
 
-- On startup, each node calls `TryAcquire`, which writes its address to the S3 lock only if the lock is absent.
-- The winner starts serving writes and begins streaming WAL entries to followers over port 2380.
-- Followers detect a dead leader when the WAL stream fails `--follower-max-retries` times consecutively (default 5). A follower then calls `TakeOver`, which overwrites the S3 lock with its own address and becomes the new leader.
-- The former leader's `watchLoop` detects the supersession and steps down (within `--leader-watch-interval-sec`, default 300 s).
-- Clients connecting to a follower for writes are automatically forwarded to the current leader; the follower returns the result transparently.
+- On startup, each node writes its address to the S3 lock only if the lock is absent. The winner becomes the leader.
+- The leader streams WAL entries to followers over port 2380.
+- Followers detect a dead leader when the WAL stream fails `--follower-max-retries` times consecutively (default 5). A follower then overwrites the S3 lock with its own address and becomes the new leader.
+- The former leader detects the supersession (within `--leader-watch-interval-sec`, default 300 s) and steps down.
+- Writes sent to a follower are automatically forwarded to the current leader; the follower returns the result transparently.
 
-No TTL polling. The only S3 writes are at startup, on TakeOver, and at each checkpoint.
+No TTL polling. The only S3 writes are at startup, on leader takeover, and at each checkpoint.
 
 ---
 
@@ -193,7 +199,7 @@ strata \
 
 Both the peer gRPC server (leader) and client (follower) use these files. The same CA must be used across all nodes. TLS 1.3 is required; mutual authentication is enforced.
 
-Generating self-signed certificates with `cfssl` or `openssl` is outside the scope of this document, but any standard PKI toolchain works.
+To configure mTLS in the embedded library, pass `credentials.TransportCredentials` directly to `Config.PeerServerTLS` and `Config.PeerClientTLS`.
 
 ---
 
@@ -252,7 +258,7 @@ Three endpoints are served on that address:
 | `PeerListenAddr` | `string` | `""` | gRPC listen address for the WAL stream. Empty = single-node. |
 | `AdvertisePeerAddr` | `string` | `PeerListenAddr` | Address followers use to reach this node. |
 | `LeaderWatchInterval` | `time.Duration` | 5 min | How often the leader re-reads the S3 lock to detect supersession. |
-| `FollowerMaxRetries` | `int` | 5 | Consecutive stream failures before a follower attempts a TakeOver. |
+| `FollowerMaxRetries` | `int` | 5 | Consecutive stream failures before a follower attempts a takeover. |
 | `PeerBufferSize` | `int` | 10 000 | WAL entries buffered in memory for follower catch-up. |
 | `PeerServerTLS` | `credentials.TransportCredentials` | `nil` | mTLS credentials for the peer gRPC server. |
 | `PeerClientTLS` | `credentials.TransportCredentials` | `nil` | mTLS credentials for the peer gRPC client. |
@@ -265,7 +271,7 @@ Three endpoints are served on that address:
 | Flag | Default | Description |
 |---|---|---|
 | `--data-dir` | `/var/lib/strata` | Pebble + WAL storage directory |
-| `--listen` | `0.0.0.0:2379` | kine/etcd gRPC listen address |
+| `--listen` | `0.0.0.0:2379` | etcd v3 gRPC listen address |
 | `--s3-bucket` | — | S3 bucket name |
 | `--s3-prefix` | — | Key prefix inside the bucket |
 | `--s3-endpoint` | — | Custom S3 endpoint (MinIO, etc.) |
@@ -277,7 +283,7 @@ Three endpoints are served on that address:
 | `--peer-listen` | — | Peer WAL stream address; enables multi-node mode |
 | `--advertise-peer` | `--peer-listen` | Advertised peer address |
 | `--leader-watch-interval-sec` | `300` | Leader lock re-read interval (seconds) |
-| `--follower-max-retries` | `5` | Stream failures before TakeOver attempt |
+| `--follower-max-retries` | `5` | Stream failures before takeover attempt |
 | `--peer-tls-ca` | — | CA certificate file for peer mTLS (PEM) |
 | `--peer-tls-cert` | — | Node certificate file for peer mTLS (PEM) |
 | `--peer-tls-key` | — | Node private key file for peer mTLS (PEM) |
@@ -351,8 +357,8 @@ type KeyValue struct {
 ### Sentinel errors
 
 ```go
-var ErrKeyExists  error // returned by Create when the key already exists
-var ErrNotLeader  error // returned by writes when forwarding is not available
+var ErrKeyExists error // returned by Create when the key already exists
+var ErrNotLeader error // returned by writes when forwarding is not available
 ```
 
 ---
@@ -364,7 +370,7 @@ var ErrNotLeader  error // returned by writes when forwarding is not available
                       │                    Leader node                    │
   client writes ────► │  Node.Put/Create/… → WAL.Append → store.Apply   │
                       │                          │                        │
-                      │              peer.Server.Broadcast               │
+                      │                     Broadcast                     │
                       └──────────────────────────┬───────────────────────┘
                                                  │  gRPC stream (port 2380)
                            ┌─────────────────────┴──────────────────────┐

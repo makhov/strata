@@ -1,5 +1,4 @@
-// Package strata provides an embeddable, S3-durable key-value store
-// compatible with the kine Backend interface.
+// Package strata provides an embeddable, S3-durable key-value store.
 package strata
 
 // KeyValue is a versioned key-value pair.

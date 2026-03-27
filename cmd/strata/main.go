@@ -1,5 +1,4 @@
-// Command strata runs a single-node Strata datastore and exposes it as a kine
-// endpoint that Kubernetes (via kine) can connect to directly.
+// Command strata runs a Strata node and exposes it as an etcd v3 gRPC endpoint.
 package main
 
 import (
@@ -15,15 +14,14 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	kserver "github.com/k3s-io/kine/pkg/server"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
 	"github.com/makhov/strata"
+	strataetcd "github.com/makhov/strata/etcd"
 	"github.com/makhov/strata/internal/object"
-	kinebackend "github.com/makhov/strata/kine"
 )
 
 func main() {
@@ -113,11 +111,8 @@ func rootCmd() *cobra.Command {
 			}
 			logrus.Infof("listening on %s", listenAddr)
 
-			backend := kinebackend.New(node)
-			bridge := kserver.New(backend, "grpc", 1*time.Second, "3.5.13")
-
 			srv := grpc.NewServer()
-			bridge.Register(srv)
+			strataetcd.New(node).Register(srv)
 
 			go func() {
 				if err := srv.Serve(lis); err != nil {
