@@ -21,6 +21,11 @@ type Config struct {
 	// leader election. If nil the node runs in single-node mode.
 	ObjectStore object.Store
 
+	// RestorePoint, if set, causes the node to bootstrap from a specific
+	// point in time on first boot rather than reading the latest checkpoint
+	// from ObjectStore. See RestorePoint for details.
+	RestorePoint *RestorePoint
+
 	// SegmentMaxSize is the byte threshold that triggers WAL segment rotation.
 	// Default: 50 MB.
 	SegmentMaxSize int64

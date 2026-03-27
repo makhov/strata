@@ -1,15 +1,71 @@
 package strata_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/makhov/strata"
+	"github.com/makhov/strata/internal/checkpoint"
 	"github.com/makhov/strata/pkg/object"
 )
+
+// snapshotStore wraps MemStore, recording a version ID for every Put so a
+// RestorePoint can be constructed from a captured moment in time.
+type snapshotStore struct {
+	object.Store
+	mu          sync.Mutex
+	byVer       map[string][]byte
+	latestByKey map[string]string
+	seq         int
+}
+
+func newSnapshotStore() *snapshotStore {
+	return &snapshotStore{
+		Store:       object.NewMem(),
+		byVer:       make(map[string][]byte),
+		latestByKey: make(map[string]string),
+	}
+}
+
+func (s *snapshotStore) Put(ctx context.Context, key string, r io.Reader) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if err := s.Store.Put(ctx, key, bytes.NewReader(data)); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.seq++
+	vid := fmt.Sprintf("ver%d", s.seq)
+	s.byVer[vid] = data
+	s.latestByKey[key] = vid
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *snapshotStore) GetVersioned(_ context.Context, _, versionID string) (io.ReadCloser, error) {
+	s.mu.Lock()
+	data, ok := s.byVer[versionID]
+	s.mu.Unlock()
+	if !ok {
+		return nil, object.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// versionOf returns the current version ID for key, or "" if not yet written.
+func (s *snapshotStore) versionOf(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.latestByKey[key]
+}
 
 // freeAddrImpl allocates a random TCP port and releases it.
 func freeAddrImpl(t testing.TB) string {
@@ -286,5 +342,103 @@ func TestE2EThreeNode(t *testing.T) {
 	kv, err = newLeader.Get("/cluster/after-failover")
 	if err != nil || kv == nil || string(kv.Value) != "ok" {
 		t.Errorf("read after failover: err=%v kv=%v", err, kv)
+	}
+}
+
+// ── RestorePoint ──────────────────────────────────────────────────────────────
+
+// TestRestorePoint verifies that a node bootstrapped with a RestorePoint
+// contains exactly the data present at the snapshot moment — no more, no less.
+func TestRestorePoint(t *testing.T) {
+	store := newSnapshotStore()
+	dirA := t.TempDir()
+	ctx := context.Background()
+
+	// Node A: write 5 keys, wait for checkpoint and WAL segment upload.
+	nodeA, err := strata.Open(strata.Config{
+		DataDir:            dirA,
+		ObjectStore:        store,
+		SegmentMaxAge:      20 * time.Millisecond,
+		CheckpointInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("open node A: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, err := nodeA.Create(ctx, fmt.Sprintf("/key/%d", i), []byte("before"), 0); err != nil {
+			t.Fatalf("Create key %d: %v", i, err)
+		}
+	}
+
+	// Wait for at least one checkpoint and WAL upload cycle.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		m, _ := checkpoint.ReadManifest(ctx, store)
+		if m != nil && store.versionOf(m.CheckpointKey) != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Capture the restore point: checkpoint archive + all WAL segments so far.
+	manifest, err := checkpoint.ReadManifest(ctx, store)
+	if err != nil || manifest == nil {
+		t.Fatalf("ReadManifest: err=%v manifest=%v", err, manifest)
+	}
+	walKeys, err := store.List(ctx, "wal/")
+	if err != nil {
+		t.Fatalf("List wal: %v", err)
+	}
+	walSegs := make([]strata.PinnedObject, 0, len(walKeys))
+	for _, k := range walKeys {
+		if ver := store.versionOf(k); ver != "" {
+			walSegs = append(walSegs, strata.PinnedObject{Key: k, VersionID: ver})
+		}
+	}
+	rp := &strata.RestorePoint{
+		Store:             store,
+		CheckpointArchive: strata.PinnedObject{Key: manifest.CheckpointKey, VersionID: store.versionOf(manifest.CheckpointKey)},
+		WALSegments:       walSegs,
+	}
+
+	// Node A: write 5 more keys after the snapshot — these must NOT appear in node B.
+	for i := 5; i < 10; i++ {
+		if _, err := nodeA.Create(ctx, fmt.Sprintf("/key/%d", i), []byte("after"), 0); err != nil {
+			t.Fatalf("Create key %d: %v", i, err)
+		}
+	}
+	nodeA.Close()
+
+	// Node B: boot from the RestorePoint into a fresh directory.
+	// It uses a separate ObjectStore for its own future writes so it doesn't
+	// interfere with node A's prefix.
+	dirB := t.TempDir()
+	nodeB, err := strata.Open(strata.Config{
+		DataDir:      dirB,
+		ObjectStore:  object.NewMem(),
+		RestorePoint: rp,
+	})
+	if err != nil {
+		t.Fatalf("open node B: %v", err)
+	}
+	defer nodeB.Close()
+
+	// Keys 0-4 must be present.
+	for i := 0; i < 5; i++ {
+		kv, err := nodeB.Get(fmt.Sprintf("/key/%d", i))
+		if err != nil || kv == nil {
+			t.Errorf("key %d: expected present, got err=%v kv=%v", i, err, kv)
+		}
+	}
+	// Keys 5-9 were written after the snapshot and must be absent.
+	for i := 5; i < 10; i++ {
+		kv, err := nodeB.Get(fmt.Sprintf("/key/%d", i))
+		if err != nil {
+			t.Errorf("key %d: unexpected error: %v", i, err)
+		}
+		if kv != nil {
+			t.Errorf("key %d: expected absent, got %v", i, kv)
+		}
 	}
 }

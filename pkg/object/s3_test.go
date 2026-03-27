@@ -11,6 +11,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 
@@ -19,11 +20,11 @@ import (
 
 const testBucket = "test-bucket"
 
-// newFakeS3 spins up an in-process fake S3 server and returns an S3Store
-// pointed at it. The server is shut down via t.Cleanup.
-func newFakeS3(t *testing.T, prefix string) *object.S3Store {
+// newFakeS3Client returns a configured S3 client and httptest server for the
+// given fake S3 backend. The server is shut down via t.Cleanup.
+func newFakeS3Client(t *testing.T, backend gofakes3.Backend) (*s3.Client, string) {
 	t.Helper()
-	faker := gofakes3.New(s3mem.New())
+	faker := gofakes3.New(backend)
 	ts := httptest.NewServer(faker.Server())
 	t.Cleanup(ts.Close)
 
@@ -41,19 +42,43 @@ func newFakeS3(t *testing.T, prefix string) *object.S3Store {
 	if err != nil {
 		t.Fatalf("aws config: %v", err)
 	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) { o.UsePathStyle = true })
+	return client, ts.URL
+}
 
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-	})
-
-	// Create the bucket.
+// newFakeS3 spins up an in-process fake S3 server and returns an S3Store
+// pointed at it. The server is shut down via t.Cleanup.
+func newFakeS3(t *testing.T, prefix string) *object.S3Store {
+	t.Helper()
+	client, _ := newFakeS3Client(t, s3mem.New())
 	if _, err := client.CreateBucket(context.Background(), &s3.CreateBucketInput{
 		Bucket: aws.String(testBucket),
 	}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-
 	return object.NewS3Store(client, testBucket, prefix)
+}
+
+// newFakeS3Versioned creates a fake S3 store with versioning enabled on the
+// bucket. Returns both the store and the raw client (to capture version IDs).
+func newFakeS3Versioned(t *testing.T, prefix string) (*object.S3Store, *s3.Client) {
+	t.Helper()
+	client, _ := newFakeS3Client(t, s3mem.New())
+	ctx := context.Background()
+	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(testBucket),
+	}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if _, err := client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket: aws.String(testBucket),
+		VersioningConfiguration: &types.VersioningConfiguration{
+			Status: types.BucketVersioningStatusEnabled,
+		},
+	}); err != nil {
+		t.Fatalf("PutBucketVersioning: %v", err)
+	}
+	return object.NewS3Store(client, testBucket, prefix), client
 }
 
 func TestS3PutGet(t *testing.T) {
@@ -194,5 +219,90 @@ func TestS3LargePayload(t *testing.T) {
 	}
 	if len(got) != len(payload) {
 		t.Errorf("large payload: want %d bytes got %d", len(payload), len(got))
+	}
+}
+
+func TestS3GetVersioned(t *testing.T) {
+	store, client := newFakeS3Versioned(t, "")
+	ctx := context.Background()
+
+	// Put v1 via raw client to capture the version ID.
+	out1, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(testBucket),
+		Key:    aws.String("seg"),
+		Body:   strings.NewReader("v1-content"),
+	})
+	if err != nil {
+		t.Fatalf("put v1: %v", err)
+	}
+	v1 := aws.ToString(out1.VersionId)
+
+	// Overwrite with v2.
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(testBucket),
+		Key:    aws.String("seg"),
+		Body:   strings.NewReader("v2-content"),
+	}); err != nil {
+		t.Fatalf("put v2: %v", err)
+	}
+
+	// Regular Get returns latest (v2).
+	rc, err := store.Get(ctx, "seg")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(got) != "v2-content" {
+		t.Errorf("Get: want v2-content got %q", got)
+	}
+
+	// GetVersioned with v1's ID returns the original content.
+	rc, err = store.GetVersioned(ctx, "seg", v1)
+	if err != nil {
+		t.Fatalf("GetVersioned: %v", err)
+	}
+	got, _ = io.ReadAll(rc)
+	rc.Close()
+	if string(got) != "v1-content" {
+		t.Errorf("GetVersioned: want v1-content got %q", got)
+	}
+}
+
+func TestS3GetVersionedNotFound(t *testing.T) {
+	store, _ := newFakeS3Versioned(t, "")
+	_, err := store.GetVersioned(context.Background(), "no-such-key", "no-such-version")
+	if err != object.ErrNotFound {
+		t.Errorf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestS3GetVersionedWithPrefix(t *testing.T) {
+	store, client := newFakeS3Versioned(t, "pfx")
+	ctx := context.Background()
+
+	out, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(testBucket),
+		Key:    aws.String("pfx/wal/seg1"),
+		Body:   strings.NewReader("old"),
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	ver := aws.ToString(out.VersionId)
+
+	// Overwrite via store (goes through prefix logic).
+	if err := store.Put(ctx, "wal/seg1", strings.NewReader("new")); err != nil {
+		t.Fatalf("store put: %v", err)
+	}
+
+	rc, err := store.GetVersioned(ctx, "wal/seg1", ver)
+	if err != nil {
+		t.Fatalf("GetVersioned: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(got) != "old" {
+		t.Errorf("GetVersioned with prefix: want old got %q", got)
 	}
 }

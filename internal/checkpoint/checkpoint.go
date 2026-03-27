@@ -128,6 +128,22 @@ func Restore(ctx context.Context, store object.Store, objKey, targetDir string) 
 	return term, revision, nil
 }
 
+// RestoreVersioned downloads a specific stored version of a checkpoint archive
+// and restores it to targetDir. Used for point-in-time restore via RestorePoint.
+func RestoreVersioned(ctx context.Context, store object.VersionedStore, objKey, versionID, targetDir string) (term uint64, revision int64, err error) {
+	rc, err := store.GetVersioned(ctx, objKey, versionID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("checkpoint: download versioned %q@%s: %w", objKey, versionID, err)
+	}
+	defer rc.Close()
+
+	term, revision, err = readArchive(rc, targetDir)
+	if err != nil {
+		return 0, 0, fmt.Errorf("checkpoint: restore versioned %q: %w", objKey, err)
+	}
+	return term, revision, nil
+}
+
 // ── archive format ────────────────────────────────────────────────────────────
 //
 // Header (24 bytes): magic(8) + term(8 BE) + revision(8 BE)

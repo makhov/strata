@@ -58,6 +58,24 @@ func (s *S3Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return out.Body, nil
 }
 
+// GetVersioned retrieves a specific stored version of key. Requires S3
+// versioning to be enabled on the bucket.
+func (s *S3Store) GetVersioned(ctx context.Context, key, versionID string) (io.ReadCloser, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:    aws.String(s.bucket),
+		Key:       aws.String(s.key(key)),
+		VersionId: aws.String(versionID),
+	})
+	if err != nil {
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("object/s3: get versioned %q@%s: %w", key, versionID, err)
+	}
+	return out.Body, nil
+}
+
 func (s *S3Store) Delete(ctx context.Context, key string) error {
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),

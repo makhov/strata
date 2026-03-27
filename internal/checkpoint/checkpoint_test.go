@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -14,6 +16,57 @@ import (
 	"github.com/makhov/strata/internal/checkpoint"
 	"github.com/makhov/strata/pkg/object"
 )
+
+// versionedMem wraps MemStore to record a version ID for every Put, allowing
+// RestoreVersioned to be tested without real S3.
+type versionedMem struct {
+	object.Store
+	mu          sync.Mutex
+	byVer       map[string][]byte // versionID → raw bytes
+	latestByKey map[string]string // key → current versionID
+	seq         int
+}
+
+func newVersionedMem() *versionedMem {
+	return &versionedMem{
+		Store:       object.NewMem(),
+		byVer:       make(map[string][]byte),
+		latestByKey: make(map[string]string),
+	}
+}
+
+func (v *versionedMem) Put(ctx context.Context, key string, r io.Reader) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if err := v.Store.Put(ctx, key, bytes.NewReader(data)); err != nil {
+		return err
+	}
+	v.mu.Lock()
+	v.seq++
+	vid := fmt.Sprintf("ver%d", v.seq)
+	v.byVer[vid] = data
+	v.latestByKey[key] = vid
+	v.mu.Unlock()
+	return nil
+}
+
+func (v *versionedMem) GetVersioned(_ context.Context, key, versionID string) (io.ReadCloser, error) {
+	v.mu.Lock()
+	data, ok := v.byVer[versionID]
+	v.mu.Unlock()
+	if !ok {
+		return nil, object.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (v *versionedMem) VersionOf(key string) string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.latestByKey[key]
+}
 
 // openDB opens a pebble DB in a temp directory.
 func openDB(t *testing.T) *pebble.DB {
@@ -302,4 +355,46 @@ func TestWriteRestoreMultiple(t *testing.T) {
 	if term != 1 || rev != 3 {
 		t.Errorf("restored: want term=1 rev=3, got term=%d rev=%d", term, rev)
 	}
+}
+
+// TestRestoreVersioned verifies that RestoreVersioned retrieves a pinned
+// version of a checkpoint archive even after the same key has been overwritten.
+func TestRestoreVersioned(t *testing.T) {
+	db := openDB(t)
+	store := newVersionedMem()
+	ctx := context.Background()
+
+	// Write the first checkpoint (term=1, rev=1).
+	if err := checkpoint.Write(ctx, db, store, 1, 1, ""); err != nil {
+		t.Fatalf("Write cp1: %v", err)
+	}
+	archiveKey := checkpoint.CheckpointKey(1, 1)
+	pinnedVer := store.VersionOf(archiveKey)
+
+	// Overwrite the same archive key with garbage to simulate a later version.
+	if err := store.Put(ctx, archiveKey, strings.NewReader("corrupted-data")); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+
+	// Regular Restore now reads the garbage — it should fail.
+	if _, _, err := checkpoint.Restore(ctx, store, archiveKey, t.TempDir()); err == nil {
+		t.Fatal("Restore with corrupted data: expected error, got nil")
+	}
+
+	// RestoreVersioned with the pinned version ID should succeed.
+	dir := t.TempDir()
+	term, rev, err := checkpoint.RestoreVersioned(ctx, store, archiveKey, pinnedVer, dir)
+	if err != nil {
+		t.Fatalf("RestoreVersioned: %v", err)
+	}
+	if term != 1 || rev != 1 {
+		t.Errorf("restored: want term=1 rev=1, got term=%d rev=%d", term, rev)
+	}
+
+	// Verify the restored directory contains a valid pebble database.
+	restored, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open restored pebble: %v", err)
+	}
+	restored.Close()
 }

@@ -27,3 +27,13 @@ type Store interface {
 	// List returns keys that share the given prefix, in lexicographic order.
 	List(ctx context.Context, prefix string) ([]string, error)
 }
+
+// VersionedStore extends Store with version-pinned reads. Implementations
+// backed by S3 (or any store with object versioning) can satisfy this
+// interface. It is used for point-in-time restore via RestorePoint.
+type VersionedStore interface {
+	Store
+	// GetVersioned returns a reader for a specific stored version of key.
+	// Returns ErrNotFound if the version does not exist.
+	GetVersioned(ctx context.Context, key, versionID string) (io.ReadCloser, error)
+}

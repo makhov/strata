@@ -100,7 +100,26 @@ func Open(cfg Config) (*Node, error) {
 	)
 
 	// ── Restore checkpoint ───────────────────────────────────────────────────
-	if cfg.ObjectStore != nil {
+	switch {
+	case cfg.RestorePoint != nil:
+		// Point-in-time restore from pinned S3 version IDs. Only applied on
+		// first boot; subsequent restarts skip this block because pebbleDir
+		// already exists.
+		if _, err := os.Stat(pebbleDir); errors.Is(err, os.ErrNotExist) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			rp := cfg.RestorePoint
+			if rp.CheckpointArchive.Key != "" {
+				t, rev, err := checkpoint.RestoreVersioned(ctx, rp.Store,
+					rp.CheckpointArchive.Key, rp.CheckpointArchive.VersionID, pebbleDir)
+				if err != nil {
+					return nil, fmt.Errorf("strata: restore versioned checkpoint: %w", err)
+				}
+				term, startRev = t, rev
+				logrus.Infof("strata: versioned checkpoint restored (term=%d rev=%d)", term, startRev)
+			}
+		}
+	case cfg.ObjectStore != nil:
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		manifest, err := checkpoint.ReadManifest(ctx, cfg.ObjectStore)
@@ -153,7 +172,16 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	// ── Replay remote WAL (S3) ───────────────────────────────────────────────
-	if cfg.ObjectStore != nil {
+	switch {
+	case cfg.RestorePoint != nil:
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := replayPinned(ctx, db, cfg.RestorePoint, startRev); err != nil {
+			w.Close()
+			db.Close()
+			return nil, fmt.Errorf("strata: pinned WAL replay: %w", err)
+		}
+	case cfg.ObjectStore != nil:
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		if err := replayRemote(ctx, db, cfg.ObjectStore, startRev); err != nil {
@@ -936,6 +964,39 @@ func replayLocal(db *istore.Store, walDir string, afterRev int64) error {
 		closer()
 		if readErr != nil {
 			logrus.Warnf("strata: partial local segment %q: %v", path, readErr)
+		}
+		var applicable []wal.Entry
+		for _, e := range entries {
+			if e.Revision > afterRev {
+				applicable = append(applicable, *e)
+			}
+		}
+		if len(applicable) > 0 {
+			if err := db.Recover(applicable); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// replayPinned replays the specific WAL segments listed in rp, applying
+// entries with revision > afterRev. Used during RestorePoint bootstrap.
+func replayPinned(ctx context.Context, db *istore.Store, rp *RestorePoint, afterRev int64) error {
+	for _, seg := range rp.WALSegments {
+		rc, err := rp.Store.GetVersioned(ctx, seg.Key, seg.VersionID)
+		if err != nil {
+			return fmt.Errorf("replayPinned get %q@%s: %w", seg.Key, seg.VersionID, err)
+		}
+		sr, err := wal.NewSegmentReader(rc)
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("replayPinned segment %q: %w", seg.Key, err)
+		}
+		entries, readErr := sr.ReadAll()
+		rc.Close()
+		if readErr != nil {
+			logrus.Warnf("strata: partial pinned segment %q: %v", seg.Key, readErr)
 		}
 		var applicable []wal.Entry
 		for _, e := range entries {
