@@ -1,0 +1,305 @@
+package checkpoint_test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/cockroachdb/pebble"
+
+	"github.com/makhov/strata/internal/checkpoint"
+	"github.com/makhov/strata/internal/object"
+)
+
+// openDB opens a pebble DB in a temp directory.
+func openDB(t *testing.T) *pebble.DB {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("pebble.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// ── Manifest ──────────────────────────────────────────────────────────────────
+
+func TestReadManifestMissing(t *testing.T) {
+	store := object.NewMem()
+	m, err := checkpoint.ReadManifest(context.Background(), store)
+	if err != nil {
+		t.Fatalf("ReadManifest on empty store: %v", err)
+	}
+	if m != nil {
+		t.Errorf("expected nil manifest, got %+v", m)
+	}
+}
+
+func TestWriteReadManifest(t *testing.T) {
+	store := object.NewMem()
+	ctx := context.Background()
+
+	want := &checkpoint.Manifest{
+		CheckpointKey: "checkpoint/0000000001/00000000000000000042",
+		Revision:      42,
+		Term:          1,
+		LastWALKey:    "wal/0000000001/00000000000000000040",
+	}
+	if err := checkpoint.WriteManifest(ctx, store, want); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+
+	got, err := checkpoint.ReadManifest(ctx, store)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected manifest, got nil")
+	}
+	if got.CheckpointKey != want.CheckpointKey {
+		t.Errorf("CheckpointKey: want %q got %q", want.CheckpointKey, got.CheckpointKey)
+	}
+	if got.Revision != want.Revision {
+		t.Errorf("Revision: want %d got %d", want.Revision, got.Revision)
+	}
+	if got.Term != want.Term {
+		t.Errorf("Term: want %d got %d", want.Term, got.Term)
+	}
+	if got.LastWALKey != want.LastWALKey {
+		t.Errorf("LastWALKey: want %q got %q", want.LastWALKey, got.LastWALKey)
+	}
+}
+
+func TestWriteManifestOverwrite(t *testing.T) {
+	store := object.NewMem()
+	ctx := context.Background()
+
+	checkpoint.WriteManifest(ctx, store, &checkpoint.Manifest{Revision: 1, Term: 1,
+		CheckpointKey: checkpoint.CheckpointKey(1, 1)})
+	checkpoint.WriteManifest(ctx, store, &checkpoint.Manifest{Revision: 2, Term: 1,
+		CheckpointKey: checkpoint.CheckpointKey(1, 2)})
+
+	m, _ := checkpoint.ReadManifest(ctx, store)
+	if m.Revision != 2 {
+		t.Errorf("overwrite: want revision 2, got %d", m.Revision)
+	}
+}
+
+// ── CheckpointKey ─────────────────────────────────────────────────────────────
+
+func TestCheckpointKey(t *testing.T) {
+	key := checkpoint.CheckpointKey(3, 100)
+	if !strings.HasPrefix(key, "checkpoint/") {
+		t.Errorf("key should start with checkpoint/: %q", key)
+	}
+	// Zero-padded so lexicographic == chronological.
+	k1 := checkpoint.CheckpointKey(1, 9)
+	k2 := checkpoint.CheckpointKey(1, 10)
+	if k1 >= k2 {
+		t.Errorf("key ordering: %q should sort before %q", k1, k2)
+	}
+}
+
+// ── Write / Restore ───────────────────────────────────────────────────────────
+
+func TestWriteRestore(t *testing.T) {
+	db := openDB(t)
+	store := object.NewMem()
+	ctx := context.Background()
+
+	// Write some data to pebble.
+	batch := db.NewBatch()
+	batch.Set([]byte("key1"), []byte("value1"), nil)
+	batch.Set([]byte("key2"), []byte("value2"), nil)
+	if err := batch.Commit(pebble.Sync); err != nil {
+		t.Fatalf("batch commit: %v", err)
+	}
+
+	// Create and upload checkpoint.
+	if err := checkpoint.Write(ctx, db, store, 1, 2, ""); err != nil {
+		t.Fatalf("checkpoint.Write: %v", err)
+	}
+
+	// Manifest should be updated.
+	m, err := checkpoint.ReadManifest(ctx, store)
+	if err != nil || m == nil {
+		t.Fatalf("manifest after Write: err=%v m=%v", err, m)
+	}
+	if m.Revision != 2 || m.Term != 1 {
+		t.Errorf("manifest: want rev=2 term=1, got rev=%d term=%d", m.Revision, m.Term)
+	}
+
+	// Restore to a new directory.
+	targetDir := filepath.Join(t.TempDir(), "restored")
+	term, rev, err := checkpoint.Restore(ctx, store, m.CheckpointKey, targetDir)
+	if err != nil {
+		t.Fatalf("checkpoint.Restore: %v", err)
+	}
+	if term != 1 || rev != 2 {
+		t.Errorf("restored metadata: want term=1 rev=2, got term=%d rev=%d", term, rev)
+	}
+
+	// Open the restored DB and verify data.
+	rdb, err := pebble.Open(targetDir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open restored db: %v", err)
+	}
+	defer rdb.Close()
+
+	for _, tc := range []struct{ key, want string }{
+		{"key1", "value1"},
+		{"key2", "value2"},
+	} {
+		val, closer, err := rdb.Get([]byte(tc.key))
+		if err != nil {
+			t.Errorf("restored Get(%q): %v", tc.key, err)
+			continue
+		}
+		if string(val) != tc.want {
+			t.Errorf("restored value %q: want %q got %q", tc.key, tc.want, val)
+		}
+		closer.Close()
+	}
+}
+
+func TestWriteRestoreWithLastWALKey(t *testing.T) {
+	db := openDB(t)
+	store := object.NewMem()
+	ctx := context.Background()
+
+	if err := checkpoint.Write(ctx, db, store, 2, 99, "wal/0000000002/00000000000000000090"); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	m, _ := checkpoint.ReadManifest(ctx, store)
+	if m.LastWALKey != "wal/0000000002/00000000000000000090" {
+		t.Errorf("LastWALKey: want wal/0000000002/00000000000000000090, got %q", m.LastWALKey)
+	}
+}
+
+func TestRestoreNotFound(t *testing.T) {
+	store := object.NewMem()
+	_, _, err := checkpoint.Restore(context.Background(), store, "checkpoint/missing", t.TempDir())
+	if err == nil {
+		t.Error("expected error restoring non-existent checkpoint")
+	}
+}
+
+// ── ListRemote ────────────────────────────────────────────────────────────────
+
+func TestListRemote(t *testing.T) {
+	store := object.NewMem()
+	ctx := context.Background()
+
+	db := openDB(t)
+	checkpoint.Write(ctx, db, store, 1, 10, "")
+	checkpoint.Write(ctx, db, store, 1, 20, "")
+	checkpoint.Write(ctx, db, store, 2, 30, "")
+
+	keys, err := checkpoint.ListRemote(ctx, store)
+	if err != nil {
+		t.Fatalf("ListRemote: %v", err)
+	}
+	if len(keys) != 3 {
+		t.Errorf("ListRemote: want 3 got %d: %v", len(keys), keys)
+	}
+	// Must be sorted lexicographically (== chronologically).
+	for i := 1; i < len(keys); i++ {
+		if keys[i] <= keys[i-1] {
+			t.Errorf("keys not sorted: %q <= %q", keys[i], keys[i-1])
+		}
+	}
+}
+
+func TestListRemoteEmpty(t *testing.T) {
+	keys, err := checkpoint.ListRemote(context.Background(), object.NewMem())
+	if err != nil {
+		t.Fatalf("ListRemote empty: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("want empty, got %v", keys)
+	}
+}
+
+// ── archive safety ────────────────────────────────────────────────────────────
+
+func TestRestoreRejectsPathTraversal(t *testing.T) {
+	// Build a malicious archive manually and store it.
+	store := object.NewMem()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	// Header: magic + term + revision.
+	buf.WriteString("STRTCHK\n")
+	term := make([]byte, 8)
+	rev := make([]byte, 8)
+	buf.Write(term)
+	buf.Write(rev)
+	// One file record with a path-traversal name.
+	name := []byte("../../evil")
+	meta := make([]byte, 12)
+	meta[0], meta[1], meta[2], meta[3] = 0, 0, 0, byte(len(name))
+	content := []byte("pwned")
+	meta[4], meta[5], meta[6], meta[7] = 0, 0, 0, 0
+	meta[8], meta[9], meta[10], meta[11] = 0, 0, 0, byte(len(content))
+	buf.Write(meta)
+	buf.Write(name)
+	buf.Write(content)
+
+	store.Put(ctx, "checkpoint/evil", bytes.NewReader(buf.Bytes()))
+
+	targetDir := t.TempDir()
+	_, _, err := checkpoint.Restore(ctx, store, "checkpoint/evil", targetDir)
+	if err == nil {
+		t.Error("expected error for path traversal, got nil")
+	}
+
+	// Verify the evil file was NOT written outside targetDir.
+	evil := filepath.Join(filepath.Dir(targetDir), "evil")
+	if _, serr := os.Stat(evil); serr == nil {
+		t.Errorf("path traversal succeeded: %q was created", evil)
+	}
+}
+
+// TestWriteRestoreMultiple verifies that successive checkpoints produce distinct
+// keys and that the manifest always points to the latest one.
+func TestWriteRestoreMultiple(t *testing.T) {
+	db := openDB(t)
+	store := object.NewMem()
+	ctx := context.Background()
+
+	for i := int64(1); i <= 3; i++ {
+		db.Set([]byte(fmt.Sprintf("k%d", i)), []byte("v"), pebble.Sync)
+		if err := checkpoint.Write(ctx, db, store, 1, i, ""); err != nil {
+			t.Fatalf("Write rev=%d: %v", i, err)
+		}
+	}
+
+	m, err := checkpoint.ReadManifest(ctx, store)
+	if err != nil || m == nil {
+		t.Fatalf("manifest: err=%v m=%v", err, m)
+	}
+	if m.Revision != 3 {
+		t.Errorf("manifest should point to latest: want rev=3 got %d", m.Revision)
+	}
+
+	keys, _ := checkpoint.ListRemote(ctx, store)
+	if len(keys) != 3 {
+		t.Errorf("ListRemote: want 3 checkpoints got %d", len(keys))
+	}
+
+	// Restore the latest and verify.
+	targetDir := filepath.Join(t.TempDir(), "latest")
+	term, rev, err := checkpoint.Restore(ctx, store, m.CheckpointKey, targetDir)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if term != 1 || rev != 3 {
+		t.Errorf("restored: want term=1 rev=3, got term=%d rev=%d", term, rev)
+	}
+}

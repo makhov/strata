@@ -51,8 +51,15 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 				goto done
 			}
 
-			go func(watchID int64) {
-				events, err := s.node.Watch(wctx, string(cr.Key), cr.StartRevision)
+			// node.Watch uses "last seen revision" semantics (delivers from startRev+1).
+			// The etcd protocol uses "first desired revision" semantics (0 = current, N = from N inclusive).
+			storeStartRev := s.node.CurrentRevision()
+			if cr.StartRevision > 0 {
+				storeStartRev = cr.StartRevision - 1
+			}
+
+			go func(watchID int64, startRev int64) {
+				events, err := s.node.Watch(wctx, string(cr.Key), startRev)
 				if err != nil {
 					return
 				}
@@ -68,7 +75,7 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 						return
 					}
 				}
-			}(id)
+			}(id, storeStartRev)
 
 		case *etcdserverpb.WatchRequest_CancelRequest:
 			id := v.CancelRequest.WatchId
