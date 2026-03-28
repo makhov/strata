@@ -85,6 +85,7 @@ type Node struct {
 	entriesSinceCheckpoint int64
 	cancelBg               context.CancelFunc
 	closeOnce              sync.Once
+	bgWg                   sync.WaitGroup // tracks long-running background goroutines (followLoop, checkpointLoop)
 }
 
 func (n *Node) loadRole() nodeRole   { return nodeRole(n.role.Load()) }
@@ -219,10 +220,12 @@ func Open(cfg Config) (*Node, error) {
 
 	// ── Background jobs ──────────────────────────────────────────────────────
 	if n.loadRole() != roleFollower && cfg.ObjectStore != nil && cfg.CheckpointInterval > 0 {
-		go n.checkpointLoop(bgCtx)
+		n.bgWg.Add(1)
+		go func() { defer n.bgWg.Done(); n.checkpointLoop(bgCtx) }()
 	}
 	if n.loadRole() == roleFollower {
-		go n.followLoop(bgCtx)
+		n.bgWg.Add(1)
+		go func() { defer n.bgWg.Done(); n.followLoop(bgCtx) }()
 	}
 
 	// ── Observability ─────────────────────────────────────────────────────────
@@ -463,7 +466,8 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock) (*pe
 			return nil, false
 		}
 		if n.cfg.ObjectStore != nil && n.cfg.CheckpointInterval > 0 {
-			go n.checkpointLoop(bgCtx)
+			n.bgWg.Add(1)
+			go func() { defer n.bgWg.Done(); n.checkpointLoop(bgCtx) }()
 		}
 		return nil, true
 	}
@@ -601,6 +605,10 @@ func (n *Node) Close() error {
 		} else if n.peerLis != nil {
 			n.peerLis.Close()
 		}
+		// Wait for followLoop / checkpointLoop to exit before closing WAL and
+		// DB. cancelBg has already been called above, so the loops will drain
+		// promptly; we just need to avoid closing DB under a concurrent Apply.
+		n.bgWg.Wait()
 		if werr := n.wal.Close(); werr != nil {
 			logrus.Errorf("strata: wal close: %v", werr)
 			err = werr
