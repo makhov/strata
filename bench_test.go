@@ -3,6 +3,9 @@ package strata_test
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/makhov/strata"
@@ -113,6 +116,98 @@ func BenchmarkList(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkPutParallel measures Put throughput with concurrent writers.
+// Group-commit batches concurrent writes into a single WAL fsync, so this
+// benchmark is where the Option-A improvement shows up.
+func BenchmarkPutParallel(b *testing.B) {
+	n := openBenchNode(b)
+	ctx := context.Background()
+	var counter atomic.Int64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			i := counter.Add(1)
+			if _, err := n.Put(ctx, fmt.Sprintf("/bench/par/%d", i), []byte("value"), 0); err != nil {
+				b.Error(err)
+			}
+		}
+	})
+}
+
+// BenchmarkPutParallelSingleProc verifies that group-commit batching works even
+// without true CPU parallelism. It pins GOMAXPROCS=1 so goroutines are
+// cooperatively scheduled, but still spawns 16 concurrent writers. Because each
+// writer unlocks n.mu before blocking on the done channel, all 16 can queue
+// their requests before the commit loop drains writeC — producing batches of
+// ~16 writes per fsync even on one OS thread.
+func BenchmarkPutParallelSingleProc(b *testing.B) {
+	prev := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(prev)
+
+	n := openBenchNode(b)
+	ctx := context.Background()
+
+	var writers = 16 * prev
+	var (
+		counter atomic.Int64
+		wg      sync.WaitGroup
+		work    = make(chan struct{}, b.N)
+	)
+	for i := 0; i < b.N; i++ {
+		work <- struct{}{}
+	}
+	close(work)
+
+	b.ResetTimer()
+	wg.Add(writers)
+	for w := 0; w < writers; w++ {
+		go func() {
+			defer wg.Done()
+			for range work {
+				i := counter.Add(1)
+				if _, err := n.Put(ctx, fmt.Sprintf("/bench/singleproc/%d", i), []byte("value"), 0); err != nil {
+					b.Error(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// BenchmarkPutParallelScaled runs 16*GOMAXPROCS concurrent writers so the
+// writer-to-CPU ratio stays constant across -cpu= values. Shows how group-commit
+// throughput scales as both CPU count and concurrency grow together.
+func BenchmarkPutParallelScaled(b *testing.B) {
+	n := openBenchNode(b)
+	ctx := context.Background()
+
+	writers := 16 * runtime.GOMAXPROCS(0)
+	var (
+		counter atomic.Int64
+		wg      sync.WaitGroup
+		work    = make(chan struct{}, b.N)
+	)
+	for i := 0; i < b.N; i++ {
+		work <- struct{}{}
+	}
+	close(work)
+
+	b.ResetTimer()
+	wg.Add(writers)
+	for w := 0; w < writers; w++ {
+		go func() {
+			defer wg.Done()
+			for range work {
+				i := counter.Add(1)
+				if _, err := n.Put(ctx, fmt.Sprintf("/bench/scaled/%d", i), []byte("value"), 0); err != nil {
+					b.Error(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func BenchmarkWatch(b *testing.B) {
