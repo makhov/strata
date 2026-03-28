@@ -149,7 +149,7 @@ func BenchmarkPutParallelSingleProc(b *testing.B) {
 	n := openBenchNode(b)
 	ctx := context.Background()
 
-	const writers = 16
+	var writers = 16 * prev
 	var (
 		counter atomic.Int64
 		wg      sync.WaitGroup
@@ -168,6 +168,40 @@ func BenchmarkPutParallelSingleProc(b *testing.B) {
 			for range work {
 				i := counter.Add(1)
 				if _, err := n.Put(ctx, fmt.Sprintf("/bench/singleproc/%d", i), []byte("value"), 0); err != nil {
+					b.Error(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// BenchmarkPutParallelScaled runs 16*GOMAXPROCS concurrent writers so the
+// writer-to-CPU ratio stays constant across -cpu= values. Shows how group-commit
+// throughput scales as both CPU count and concurrency grow together.
+func BenchmarkPutParallelScaled(b *testing.B) {
+	n := openBenchNode(b)
+	ctx := context.Background()
+
+	writers := 16 * runtime.GOMAXPROCS(0)
+	var (
+		counter atomic.Int64
+		wg      sync.WaitGroup
+		work    = make(chan struct{}, b.N)
+	)
+	for i := 0; i < b.N; i++ {
+		work <- struct{}{}
+	}
+	close(work)
+
+	b.ResetTimer()
+	wg.Add(writers)
+	for w := 0; w < writers; w++ {
+		go func() {
+			defer wg.Done()
+			for range work {
+				i := counter.Add(1)
+				if _, err := n.Put(ctx, fmt.Sprintf("/bench/scaled/%d", i), []byte("value"), 0); err != nil {
 					b.Error(err)
 				}
 			}
