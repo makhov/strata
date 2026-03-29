@@ -28,6 +28,15 @@ import (
 	"github.com/makhov/strata/pkg/object"
 )
 
+// walWriter is the subset of wal.WAL used by Node. The interface decouples Node
+// from the concrete WAL implementation and allows fault injection in tests.
+type walWriter interface {
+	Append(e *wal.Entry) error
+	AppendBatch(ctx context.Context, entries []*wal.Entry) error
+	SealAndFlush(nextRev int64) error
+	Close() error
+}
+
 // Sentinel errors.
 var (
 	ErrKeyExists = errors.New("strata: key already exists")
@@ -66,10 +75,11 @@ const (
 type writeReq struct {
 	entry wal.Entry
 	done  chan error
+	ctx   context.Context
 }
 
-func newWriteReq(e wal.Entry) *writeReq {
-	return &writeReq{entry: e, done: make(chan error, 1)}
+func newWriteReq(ctx context.Context, e wal.Entry) *writeReq {
+	return &writeReq{entry: e, done: make(chan error, 1), ctx: ctx}
 }
 
 // pendingKV tracks an in-flight write that has been assigned a revision and
@@ -88,7 +98,7 @@ type Node struct {
 	role atomic.Int32 // stores nodeRole values; use loadRole/storeRole
 
 	db  *istore.Store
-	wal *wal.WAL // non-nil on leader/single; non-nil on follower (local WAL, no uploader)
+	wal walWriter // non-nil on leader/single; non-nil on follower (local WAL, no uploader)
 
 	// mu serialises all leader writes for CAS safety and role transitions.
 	mu sync.Mutex
@@ -765,12 +775,16 @@ func (n *Node) Put(ctx context.Context, key string, value []byte, lease int64) (
 	}
 	start := time.Now()
 	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return 0, ErrClosed
+	}
 	e, err := n.preparePut(key, value, lease)
 	if err != nil {
 		n.mu.Unlock()
 		return 0, err
 	}
-	req := newWriteReq(e)
+	req := newWriteReq(ctx, e)
 	n.writeC <- req
 	n.mu.Unlock()
 	return n.await(ctx, req, opLabel(e.Op), start, key, e.Revision)
@@ -817,6 +831,10 @@ func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64
 	}
 	start := time.Now()
 	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return 0, ErrClosed
+	}
 	existing, err := n.readKey(key)
 	if err != nil {
 		n.mu.Unlock()
@@ -839,7 +857,7 @@ func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64
 		Revision: newRev, Term: n.term, Op: wal.OpCreate,
 		Key: key, Value: value, Lease: lease, CreateRevision: newRev,
 	}
-	req := newWriteReq(e)
+	req := newWriteReq(ctx, e)
 	n.writeC <- req
 	n.mu.Unlock()
 	return n.await(ctx, req, "create", start, key, newRev)
@@ -856,6 +874,10 @@ func (n *Node) Update(ctx context.Context, key string, value []byte, revision, l
 	}
 	start := time.Now()
 	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return 0, nil, false, ErrClosed
+	}
 	existing, err := n.readKey(key)
 	if err != nil {
 		n.mu.Unlock()
@@ -882,7 +904,7 @@ func (n *Node) Update(ctx context.Context, key string, value []byte, revision, l
 		CreateRevision: existing.CreateRevision, PrevRevision: existing.Revision,
 	}
 	oldKV := toKV(existing)
-	req := newWriteReq(e)
+	req := newWriteReq(ctx, e)
 	n.writeC <- req
 	n.mu.Unlock()
 	newRev, err = n.await(ctx, req, "update", start, key, newRev)
@@ -903,12 +925,16 @@ func (n *Node) Delete(ctx context.Context, key string) (int64, error) {
 	}
 	start := time.Now()
 	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return 0, ErrClosed
+	}
 	e, err := n.prepareDelete(key)
 	if err != nil || e.Key == "" {
 		n.mu.Unlock()
 		return 0, err // key not found — no-op
 	}
-	req := newWriteReq(e)
+	req := newWriteReq(ctx, e)
 	n.writeC <- req
 	n.mu.Unlock()
 	return n.await(ctx, req, "delete", start, key, e.Revision)
@@ -925,6 +951,10 @@ func (n *Node) DeleteIfRevision(ctx context.Context, key string, revision int64)
 	}
 	start := time.Now()
 	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return 0, nil, false, ErrClosed
+	}
 	existing, err := n.readKey(key)
 	if err != nil {
 		n.mu.Unlock()
@@ -945,7 +975,7 @@ func (n *Node) DeleteIfRevision(ctx context.Context, key string, revision int64)
 		n.mu.Unlock()
 		return 0, nil, false, err
 	}
-	req := newWriteReq(e)
+	req := newWriteReq(ctx, e)
 	n.writeC <- req
 	n.mu.Unlock()
 	newRev, err := n.await(ctx, req, "delete", start, key, e.Revision)
@@ -1015,10 +1045,20 @@ func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.T
 	select {
 	case err = <-req.done:
 	case <-ctx.Done():
-		// Entry is already queued; drain done in background so the commit loop
-		// is never blocked, and clean up the pending entry asynchronously.
-		go func() { <-req.done; cleanPending() }()
-		return 0, ctx.Err()
+		// Give the commit loop a brief window to react: it may have already
+		// detected our cancellation (via batchCtx) and is about to signal us
+		// with a meaningful error. If it does, use that result instead of
+		// ctx.Err() so callers see a system-level error rather than their own
+		// deadline expiry.
+		timer := time.NewTimer(5 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case err = <-req.done:
+			// commit loop responded promptly; fall through to normal handling
+		case <-timer.C:
+			go func() { <-req.done; cleanPending() }()
+			return 0, ctx.Err()
+		}
 	}
 	cleanPending()
 	if err != nil {
@@ -1037,7 +1077,13 @@ func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.T
 // them to Pebble as a batch, and signals each caller's done channel.
 func (n *Node) commitLoop(ctx context.Context) {
 	defer func() {
-		// Drain any remaining requests and return an error to callers.
+		// Fence the node so no new writes can enter the queue after we drain it.
+		// Acquire n.mu so that any writer currently between the closed check and
+		// the writeC send (still holding the lock) finishes before we mark closed.
+		n.mu.Lock()
+		n.closed.Store(true)
+		n.mu.Unlock()
+		// Drain any requests already buffered in writeC.
 		for {
 			select {
 			case req := <-n.writeC:
@@ -1068,12 +1114,28 @@ func (n *Node) commitLoop(ctx context.Context) {
 			}
 		}
 
+		// Build a context that's cancelled when any batch caller gives up.
+		// This lets the WAL abort early (in tests / context-aware WALs) if
+		// all callers have abandoned the batch. Real fsyncs complete normally.
+		batchCtx, batchCancel := context.WithCancel(ctx)
+		for _, req := range batch {
+			r := req
+			go func() {
+				select {
+				case <-r.ctx.Done():
+					batchCancel()
+				case <-batchCtx.Done():
+				}
+			}()
+		}
+
 		// Write all entries to WAL with one fsync.
 		entries := make([]*wal.Entry, len(batch))
 		for i, req := range batch {
 			entries[i] = &req.entry
 		}
-		err := n.wal.AppendBatch(entries)
+		err := n.wal.AppendBatch(batchCtx, entries)
+		batchCancel() // release watcher goroutines
 
 		// Apply all entries to Pebble as one batch (in order).
 		if err == nil {
@@ -1098,6 +1160,16 @@ func (n *Node) commitLoop(ctx context.Context) {
 		for _, req := range batch {
 			req.done <- err
 		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// Callers abandoned the batch; this is not a permanent fault.
+				// Let the loop continue for the next batch.
+				continue
+			}
+			// A WAL or Pebble error leaves the segment in an unknown state.
+			// Stop accepting writes immediately; the defer will fence the node.
+			return
+		}
 	}
 }
 
@@ -1112,12 +1184,16 @@ func (n *Node) Compact(ctx context.Context, revision int64) error {
 	}
 	start := time.Now()
 	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return ErrClosed
+	}
 	n.nextRev++
 	e := wal.Entry{
 		Revision: n.nextRev, Term: n.term, Op: wal.OpCompact,
 		PrevRevision: revision,
 	}
-	req := newWriteReq(e)
+	req := newWriteReq(ctx, e)
 	n.writeC <- req
 	n.mu.Unlock()
 	_, err := n.await(ctx, req, "compact", start, "", e.Revision)
