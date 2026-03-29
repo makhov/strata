@@ -127,7 +127,12 @@ func (w *WAL) Append(e *Entry) error {
 // AppendBatch writes all entries to the active segment and fsyncs once.
 // This amortises the fsync cost across all entries in the batch.
 // Safe to call concurrently; writes are serialised under the mutex.
-func (w *WAL) AppendBatch(entries []*Entry) error {
+// ctx is checked before acquiring the lock; a cancelled ctx causes an early
+// return. The fsync itself is not interrupted mid-way.
+func (w *WAL) AppendBatch(ctx context.Context, entries []*Entry) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
