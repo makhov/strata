@@ -45,6 +45,12 @@ type WAL struct {
 	active *SegmentWriter
 	closed bool
 
+	// uploadCtx is derived from the context passed to Start. It is used for
+	// synchronous S3 uploads inside rotateSyncLocked so that per-request
+	// timeouts (batchCtx) cannot cancel a durable upload mid-way.
+	uploadCtx    context.Context
+	uploadCancel context.CancelFunc
+
 	uploadC     chan uploadTask
 	wg          sync.WaitGroup
 	cancelLoops context.CancelFunc // cancels rotationLoop and uploadLoop
@@ -107,6 +113,10 @@ func WithSyncUpload() Option {
 
 // Start launches background goroutines. Must be called before Append.
 func (w *WAL) Start(ctx context.Context) {
+	// uploadCtx lives as long as the WAL itself (cancelled by Close) so that
+	// synchronous uploads in rotateSyncLocked are not cancelled by per-request
+	// deadline contexts.
+	w.uploadCtx, w.uploadCancel = context.WithCancel(ctx)
 	loopCtx, cancel := context.WithCancel(ctx)
 	w.cancelLoops = cancel
 	w.wg.Add(2)
@@ -176,8 +186,15 @@ func (w *WAL) AppendBatch(ctx context.Context, entries []*Entry) error {
 // sealed segment to object storage synchronously. The mutex is released during
 // the upload and reacquired before returning, so the deferred Unlock in
 // AppendBatch remains correct.
+//
+// The upload uses w.uploadCtx (derived from the WAL's Start context) rather
+// than the per-batch ctx so that a per-request deadline cannot cancel the
+// upload mid-way. A cancelled upload would leave a sealed segment on disk that
+// is not yet in S3; on restart replayLocal would apply those entries as ghost
+// data even though the write had returned an error to the caller.
+//
 // Must be called with w.mu held; returns with w.mu held.
-func (w *WAL) rotateSyncLocked(ctx context.Context) error {
+func (w *WAL) rotateSyncLocked(_ context.Context) error {
 	seg := w.active
 	if seg == nil || seg.EntryCount() == 0 {
 		return nil
@@ -200,7 +217,7 @@ func (w *WAL) rotateSyncLocked(ctx context.Context) error {
 	// already in place, so any concurrent AppendBatch will wait on the mutex
 	// and write to the new segment after we reacquire.
 	w.mu.Unlock()
-	uploadErr := w.uploader(ctx, localPath, objKey)
+	uploadErr := w.uploader(w.uploadCtx, localPath, objKey)
 	w.mu.Lock()
 
 	if uploadErr != nil {
@@ -356,6 +373,11 @@ func (w *WAL) Close() error {
 		w.cancelLoops()
 	}
 	w.wg.Wait()
+	// Cancel the upload context AFTER the background loops exit so that any
+	// in-flight rotateSyncLocked that is mid-upload can still complete.
+	if w.uploadCancel != nil {
+		w.uploadCancel()
+	}
 
 	if w.uploader == nil {
 		return nil

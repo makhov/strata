@@ -31,6 +31,13 @@ type Server struct {
 	followers      map[string]chan *wal.Entry
 	forwardHandler ForwardHandler
 
+	// startRev is the first revision this leader will ever write — i.e.
+	// db.CurrentRevision()+1 at the moment becomeLeader ran.  A follower that
+	// connects with FromRevision < startRev has missed entries that are only
+	// in S3 (never in this leader's ring buffer) and must re-sync from S3
+	// before it can consume the live stream.
+	startRev int64
+
 	// gracefulGoodbyes tracks followers that sent a GoodBye RPC before
 	// disconnecting. Their stream disconnect will not trigger DisconnectC.
 	gracefulGoodbyes map[string]struct{}
@@ -63,6 +70,16 @@ func (s *Server) ConnectedFollowers() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.followers)
+}
+
+// SetStartRev records the first revision this leader owns — callers pass
+// db.CurrentRevision()+1 immediately after becomeLeader completes its S3
+// replay.  Followers that connect with FromRevision < startRev are missing
+// entries that will never appear in the ring buffer; they must re-sync.
+func (s *Server) SetStartRev(rev int64) {
+	s.mu.Lock()
+	s.startRev = rev
+	s.mu.Unlock()
 }
 
 // SetForwardHandler registers the handler that processes forwarded writes.
@@ -104,6 +121,16 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 	// Holding the lock here means Broadcast also blocks, so entries that arrive
 	// during "snapshot + register" will be in the channel — no gap.
 	s.mu.Lock()
+	// A follower whose FromRevision is below startRev has missed entries that
+	// were committed by a prior leader and replayed from S3 by this leader —
+	// those entries are in Pebble but will never appear in the ring buffer.
+	// The follower must re-sync from S3 before it can consume the live stream.
+	if s.startRev > 0 && req.FromRevision < s.startRev {
+		s.mu.Unlock()
+		logrus.Warnf("peer: follower %q needs resync (fromRev=%d < leaderStartRev=%d)",
+			req.NodeID, req.FromRevision, s.startRev)
+		return ErrResyncRequired
+	}
 	snapshot, ok := s.buf.since(req.FromRevision)
 	if !ok {
 		s.mu.Unlock()

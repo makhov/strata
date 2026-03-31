@@ -549,6 +549,11 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 	// Install the forward handler after role is set to leader so that
 	// HandleForward sees the correct role and executes writes directly.
 	peerSrv.SetForwardHandler(n)
+	// Tell the peer server what the first revision this leader will write is.
+	// Followers connecting with a lower fromRev are missing entries that were
+	// only replayed into Pebble from S3 (never in the ring buffer) and must
+	// re-sync before consuming the live stream.
+	peerSrv.SetStartRev(n.db.CurrentRevision() + 1)
 
 	go func() {
 		if err := grpcSrv.Serve(lis); err != nil {
@@ -733,9 +738,30 @@ func (n *Node) followLoop(bgCtx context.Context) {
 		}
 
 		if peer.IsResyncRequired(err) {
-			logrus.Error("strata: follower resync required — restart the node to re-bootstrap from S3")
-			n.cancelBg()
-			return
+			if n.cfg.ObjectStore == nil {
+				logrus.Error("strata: follower resync required but no object store — restart node")
+				n.cancelBg()
+				return
+			}
+			// Re-sync from S3 in-process: replay any entries the new leader
+			// has in Pebble (from its own S3 replay) that were never streamed
+			// to us by the old leader.
+			logrus.Warn("strata: follower resync required — replaying remote WAL from S3")
+			reCtx, reCancel := context.WithTimeout(bgCtx, 5*time.Minute)
+			rerr := replayRemote(reCtx, n.db, n.cfg.ObjectStore, n.db.CurrentRevision())
+			reCancel()
+			if rerr != nil {
+				logrus.Errorf("strata: follower S3 resync failed: %v — retrying", rerr)
+				select {
+				case <-time.After(2 * time.Second):
+				case <-bgCtx.Done():
+					return
+				}
+			} else {
+				fromRev = n.db.CurrentRevision() + 1
+				logrus.Infof("strata: follower resync complete (now at rev=%d)", n.db.CurrentRevision())
+			}
+			continue
 		}
 
 		if peer.IsLeaderUnreachable(err) || peer.IsLeaderShutdown(err) {
