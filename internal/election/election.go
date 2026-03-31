@@ -100,10 +100,20 @@ func (l *Lock) TryAcquire(ctx context.Context, floorTerm uint64) (*LockRecord, b
 // unreachable.  Uses an atomic conditional PUT to resolve races between
 // concurrent candidates: only the node that observed a specific ETag can
 // overwrite it.
+//
+// If, by the time TakeOver reads the lock, a different node already holds a
+// term higher than floorTerm, that node won a concurrent TakeOver race.
+// Back off and return (winner, false) so the caller can follow the new leader.
 func (l *Lock) TakeOver(ctx context.Context, floorTerm uint64) (*LockRecord, bool, error) {
 	cur, err := l.readWithETag(ctx)
 	if err != nil {
 		return nil, false, err
+	}
+
+	// Another node already took over (its term is already above what we
+	// expected to see): back off to avoid cascading leadership churn.
+	if cur.rec != nil && cur.rec.NodeID != l.nodeID && cur.rec.Term > floorTerm {
+		return cur.rec, false, nil
 	}
 
 	newTerm := floorTerm + 1

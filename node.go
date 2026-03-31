@@ -146,8 +146,8 @@ type Node struct {
 
 	closeOnce sync.Once
 	closed    atomic.Bool
-	bgWg                   sync.WaitGroup // tracks long-running background goroutines (followLoop, checkpointLoop)
-	readWg                 sync.WaitGroup // tracks in-flight read operations; waited before db.Close()
+	bgWg      sync.WaitGroup // tracks long-running background goroutines (followLoop, checkpointLoop)
+	readWg    sync.WaitGroup // tracks in-flight read operations; waited before db.Close()
 }
 
 func (n *Node) loadRole() nodeRole   { return nodeRole(n.role.Load()) }
@@ -573,28 +573,22 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 //
 // Split-brain prevention strategy:
 //
-//  1. On any follower disconnect: immediately fence writes (~50ms), read S3 to
-//     confirm still leader, then write a liveness Touch (LastSeenNano=now) if
-//     other followers are still connected. The Touch signals "I'm alive" so the
-//     disconnected follower backs off from TakeOver if it reads the lock.
+//  1. Periodic fallback: LeaderWatchInterval reads S3 to detect supersession.
+//     Does not touch LastSeenNano — followers are healthy while connected.
 //
-//  2. Keep polling + touching every peer.FollowerRetryInterval during the grace
-//     window (FollowerMaxRetries+1 intervals). This refreshes LastSeenNano so
-//     the disconnected follower always sees a fresh record while the leader is
-//     alive. Each poll fences writes only for its ~50ms duration (GET + PUT).
-//     If the grace window ends while 0 followers are connected, polling
-//     continues indefinitely — the leader has no way to broadcast liveness, so
-//     it must detect a completed TakeOver via S3 reads as quickly as possible.
+//  2. On follower disconnect: immediately fence writes (~50ms), verify still
+//     leader, touch LastSeenNano so the disconnected follower backs off from
+//     TakeOver. Begin polling every peer.FollowerRetryInterval to keep
+//     LastSeenNano fresh and detect any TakeOver that follows. Stop polling
+//     once followers reconnect.
 //
-//  3. Periodic fallback: LeaderWatchInterval as a last resort (single-node mode
-//     or any edge case where no disconnect event was observed).
-//     where no follower was connected (single-node mode, etc.).
+//  3. TakeOver safety: if a follower fails to reconnect after FollowerMaxRetries
+//     it calls TakeOver. If LastSeenNano is older than LeaderLivenessTTL the
+//     TakeOver proceeds (via atomic conditional PUT). The leader detects the
+//     supersession at its next fencedCheck and steps down cleanly.
 func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) {
 	ticker := time.NewTicker(n.cfg.LeaderWatchInterval)
 	defer ticker.Stop()
-
-	// Grace window: time until a disconnected follower can call TakeOver.
-	followerTakeoverGrace := time.Duration(n.cfg.FollowerMaxRetries+1) * peer.FollowerRetryInterval
 
 	// Disconnect channel from the peer server, if we're running in multi-node mode.
 	var disconnectC <-chan struct{}
@@ -602,12 +596,10 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 		disconnectC = n.peerSrv.DisconnectC
 	}
 
-	// pollC / pollStop manage an active polling window after a disconnect.
-	// Both are nil when no polling is in progress (nil channels block in select).
+	// pollC is non-nil while liveness-touch polling is active (nil blocks in select).
 	var (
 		activePollTicker *time.Ticker
 		pollC            <-chan time.Time
-		pollStop         <-chan time.Time
 	)
 
 	stopPolling := func() {
@@ -616,14 +608,14 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 			activePollTicker = nil
 		}
 		pollC = nil
-		pollStop = nil
 	}
 
 	startPolling := func() {
-		stopPolling()
+		if activePollTicker != nil {
+			return // already polling
+		}
 		activePollTicker = time.NewTicker(peer.FollowerRetryInterval)
 		pollC = activePollTicker.C
-		pollStop = time.After(followerTakeoverGrace)
 	}
 
 	// fencedCheck fences all leader writes for the duration of one S3 GET (and
@@ -683,27 +675,21 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 			if !fencedCheck("disconnect", true) {
 				return
 			}
-			// Begin polling so we keep refreshing LastSeenNano and detect
-			// any TakeOver that happens after our immediate check.
-			// A new disconnect resets the window.
+			// Resume polling so LastSeenNano stays fresh while the follower
+			// is away.  startPolling is idempotent — if we were already polling
+			// (e.g. started at launch with no followers), this is a no-op.
 			startPolling()
 
 		case <-pollC:
-			if !fencedCheck("disconnect-poll", true) {
+			// Touch the lock to signal liveness and detect supersession.
+			if !fencedCheck("poll", true) {
 				stopPolling()
 				return
 			}
-
-		case <-pollStop:
-			// Grace window elapsed. If followers are still gone, keep polling
-			// so LastSeenNano stays fresh-or-absent and we catch a late TakeOver.
-			// If a follower reconnected, the risk has passed — revert to the
-			// periodic ticker.
-			if n.peerSrv != nil && n.peerSrv.ConnectedFollowers() == 0 {
-				logrus.Debugf("strata: leader watch: grace window elapsed, no followers — continuing poll")
-				startPolling()
-			} else {
-				logrus.Debugf("strata: leader watch: post-disconnect grace window elapsed — resuming normal watch")
+			// If followers have (re)connected, liveness touches are no longer
+			// necessary — stop polling and rely on the periodic ticker.
+			if n.peerSrv != nil && n.peerSrv.ConnectedFollowers() > 0 {
+				logrus.Debugf("strata: leader watch: followers connected — pausing liveness poll")
 				stopPolling()
 			}
 
