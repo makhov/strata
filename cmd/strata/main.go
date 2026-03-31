@@ -53,6 +53,7 @@ func runCmd() *cobra.Command {
 		segmentMaxAgeSec      int
 		checkpointIntervalMin int
 		checkpointEntries     int64
+		readConsistency       string
 		logLevel              string
 		// multi-node
 		nodeID                 string
@@ -85,6 +86,7 @@ func runCmd() *cobra.Command {
 
 			cfg := strata.Config{
 				DataDir:             dataDir,
+				ReadConsistency:     strata.ReadConsistency(readConsistency),
 				SegmentMaxSize:      segmentMaxSizeMB << 20,
 				SegmentMaxAge:       time.Duration(segmentMaxAgeSec) * time.Second,
 				CheckpointInterval:  time.Duration(checkpointIntervalMin) * time.Minute,
@@ -174,6 +176,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().IntVar(&segmentMaxAgeSec, "segment-max-age-sec", 10, "WAL segment rotation age threshold in seconds")
 	cmd.Flags().IntVar(&checkpointIntervalMin, "checkpoint-interval-min", 15, "checkpoint interval in minutes (requires --s3-bucket)")
 	cmd.Flags().Int64Var(&checkpointEntries, "checkpoint-entries", 0, "triggers a checkpoint after this many WAL entries regardless of time. 0 means disabled (requires --s3-bucket)")
+	cmd.Flags().StringVar(&readConsistency, "read-consistency", "linearizable", "read consistency for follower nodes: linearizable (ReadIndex, etcd-compatible) or serializable (local, ~115x faster but may be slightly stale)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (trace/debug/info/warn/error)")
 	// multi-node
 	cmd.Flags().StringVar(&nodeID, "node-id", "", "stable unique node identifier (default: hostname)")

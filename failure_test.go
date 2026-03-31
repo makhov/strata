@@ -280,81 +280,90 @@ func TestScale3To1(t *testing.T) {
 
 // ── TestObjectStoreUnavailableWritesSucceed ───────────────────────────────────
 
-// TestObjectStoreUnavailableWritesSucceed verifies that node writes succeed
-// even when the object store is temporarily unavailable. S3 failures are async
-// (WAL upload) and should not block the write path.
+// TestObjectStoreUnavailableWritesFail verifies that node writes fail when the
+// object store is unavailable. With synchronous WAL upload, every write must
+// reach S3 before it is acknowledged, so S3 failures surface as write errors.
+// After a write failure the node fences itself; reopening with S3 repaired
+// must recover all data that was durably written before the outage.
 func TestObjectStoreUnavailableWritesSucceed(t *testing.T) {
 	store := newFaultyStore()
+	dir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	node, err := strata.Open(strata.Config{
-		DataDir:            t.TempDir(),
-		ObjectStore:        store,
-		CheckpointInterval: 24 * time.Hour, // disable auto-checkpoint
-		SegmentMaxAge:      200 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { node.Close() })
-
-	// Write while S3 is healthy.
-	for i := 0; i < 5; i++ {
-		if _, err := node.Put(ctx, fmt.Sprintf("/avail/%d", i), []byte("v"), 0); err != nil {
-			t.Fatalf("Put (healthy): %v", err)
-		}
-	}
-
-	// Break S3.
-	store.break_()
-
-	// Writes must still succeed locally.
-	for i := 5; i < 10; i++ {
-		if _, err := node.Put(ctx, fmt.Sprintf("/avail/%d", i), []byte("v"), 0); err != nil {
-			t.Fatalf("Put (s3 broken): %v", err)
-		}
-	}
-
-	// All data is readable right now (in Pebble).
-	kvs, err := node.List("/avail/")
-	if err != nil || len(kvs) != 10 {
-		t.Errorf("List while S3 broken: err=%v got %d keys", err, len(kvs))
-	}
-}
-
-// TestObjectStoreUnavailableRecovery verifies that data written during an S3
-// outage survives a restart via local WAL replay.
-func TestObjectStoreUnavailableRecovery(t *testing.T) {
-	store := newFaultyStore()
-	dir := t.TempDir()
-	ctx := context.Background()
-
-	// First run: write data with S3 healthy, then break S3, write more.
+	// First run: write 5 keys while S3 is healthy, then break S3 and verify
+	// that subsequent writes fail.
 	func() {
 		node, err := strata.Open(strata.Config{
 			DataDir:            dir,
 			ObjectStore:        store,
 			CheckpointInterval: 24 * time.Hour,
-			SegmentMaxAge:      24 * time.Hour, // keep segments local
 		})
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
+		defer node.Close()
+
+		// Write while S3 is healthy — these must succeed.
 		for i := 0; i < 5; i++ {
-			node.Put(ctx, fmt.Sprintf("/rec/%d", i), []byte("v"), 0)
+			if _, err := node.Put(ctx, fmt.Sprintf("/avail/%d", i), []byte("v"), 0); err != nil {
+				t.Fatalf("Put (healthy): %v", err)
+			}
 		}
+
+		// Break S3: subsequent writes must fail.
 		store.break_()
-		for i := 5; i < 10; i++ {
+		if _, err := node.Put(ctx, "/avail/5", []byte("v"), 0); err == nil {
+			t.Fatal("Put (s3 broken) unexpectedly succeeded")
+		}
+	}()
+
+	// Repair S3 and reopen: the 5 pre-break keys must all be present.
+	store.repair()
+	node, err := strata.Open(strata.Config{
+		DataDir:     dir,
+		ObjectStore: store,
+	})
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer node.Close()
+
+	kvs, err := node.List("/avail/")
+	if err != nil {
+		t.Fatalf("List after reopen: %v", err)
+	}
+	if len(kvs) != 5 {
+		t.Errorf("want 5 pre-break keys, got %d", len(kvs))
+	}
+}
+
+// TestObjectStoreUnavailableRecovery verifies that data written while S3 is
+// healthy survives a node restart via WAL replay from S3.
+func TestObjectStoreUnavailableRecovery(t *testing.T) {
+	store := newFaultyStore()
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// First run: write data with S3 healthy, then close.
+	func() {
+		node, err := strata.Open(strata.Config{
+			DataDir:            dir,
+			ObjectStore:        store,
+			CheckpointInterval: 24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		for i := 0; i < 10; i++ {
 			if _, err := node.Put(ctx, fmt.Sprintf("/rec/%d", i), []byte("v"), 0); err != nil {
-				t.Fatalf("Put with S3 broken: %v", err)
+				t.Fatalf("Put: %v", err)
 			}
 		}
 		node.Close()
 	}()
 
-	// Repair S3 and reopen: all data should be recovered from local WAL.
-	store.repair()
+	// Reopen: all data should be recovered from S3 WAL.
 	node, err := strata.Open(strata.Config{
 		DataDir:     dir,
 		ObjectStore: store,
@@ -575,23 +584,19 @@ func TestWALReplayAfterPartialUpload(t *testing.T) {
 //
 // This exercises the forceCheckpoint call added to checkpointLoop.
 func TestStartupCheckpointCoversLocalWAL(t *testing.T) {
-	// walBlocking lets checkpoints/manifests through but drops all WAL PUTs,
-	// so the only path to S3 durability is via a checkpoint.
-	store := newWALBlockingStore()
+	store := object.NewMem()
 	dir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	const prefix = "/cp-covers-wal/"
 
-	// ── Phase 1: write data, WAL segment never reaches S3 ────────────────────
+	// ── Phase 1: write data (S3 receives all WAL segments via sync upload) ────
 	func() {
 		node, err := strata.Open(strata.Config{
 			DataDir:            dir,
 			ObjectStore:        store,
 			CheckpointInterval: 24 * time.Hour, // no auto-checkpoint
-			SegmentMaxAge:      24 * time.Hour, // no auto-rotate
-			SegmentMaxSize:     500 << 20,
 		})
 		if err != nil {
 			t.Fatalf("phase-1 Open: %v", err)
@@ -601,22 +606,15 @@ func TestStartupCheckpointCoversLocalWAL(t *testing.T) {
 				t.Fatalf("phase-1 Put %d: %v", i, err)
 			}
 		}
-		node.Close() // ignores the WAL upload error
+		node.Close()
 	}()
 
-	// S3 has no WAL segments.
-	walKeys, _ := store.List(ctx, "wal/")
-	if len(walKeys) != 0 {
-		t.Fatalf("expected no WAL in S3 after phase-1, got %v", walKeys)
-	}
-
-	// ── Phase 2: restart node; startup checkpoint captures the local data ─────
+	// ── Phase 2: restart node; startup checkpoint is written immediately ──────
 	func() {
 		node, err := strata.Open(strata.Config{
 			DataDir:            dir,
 			ObjectStore:        store,
 			CheckpointInterval: 50 * time.Millisecond, // allow startup checkpoint
-			SegmentMaxAge:      50 * time.Millisecond,
 		})
 		if err != nil {
 			t.Fatalf("phase-2 Open: %v", err)
@@ -940,29 +938,27 @@ func TestBootstrapGCRace(t *testing.T) {
 // This exercises the uploadLocalWALSegments call added to becomeLeader.
 //
 // Scenario:
-//  1. A single-node writes data; S3 writes are fully blocked so the WAL segment
-//     stays local (Pebble has the data on disk, S3 is empty).
-//  2. The node is restarted in multi-node (peer) mode so that becomeLeader is
-//     called; the store is now unblocked.
+//  1. A single-node writes data with no object store configured; the WAL
+//     segment stays local only (no S3 at all).
+//  2. The node is restarted in multi-node (peer) mode with an object store,
+//     so becomeLeader is called.
 //  3. becomeLeader calls uploadLocalWALSegments, which uploads the local
 //     segment to S3.
 //  4. A fresh node (empty data dir) bootstraps from S3 and must see all data.
 func TestLocalWALUploadedOnLeaderElection(t *testing.T) {
 	mem := object.NewMem()
 	tracked := newTrackingStore(mem)
-	faulty := &faultyStore{inner: tracked}
 	dir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	const prefix = "/leader-upload/"
 
-	// ── Phase 1: write data with S3 fully blocked ─────────────────────────────
-	faulty.break_()
+	// ── Phase 1: write data without any object store (WAL stays local) ────────
 	func() {
 		node, err := strata.Open(strata.Config{
 			DataDir:            dir,
-			ObjectStore:        faulty,
+			ObjectStore:        nil, // no S3 — WAL is local only
 			CheckpointInterval: 24 * time.Hour,
 			SegmentMaxAge:      24 * time.Hour,
 			SegmentMaxSize:     500 << 20,
@@ -984,13 +980,12 @@ func TestLocalWALUploadedOnLeaderElection(t *testing.T) {
 		t.Fatalf("expected no WAL in S3 after phase-1, got %v", walKeys)
 	}
 
-	// ── Phase 2: restart in multi-node mode with S3 repaired ──────────────────
+	// ── Phase 2: restart in multi-node mode with S3 ───────────────────────────
 	// becomeLeader will call uploadLocalWALSegments before opening the new WAL.
-	faulty.repair()
 	peerAddr := freeAddrImpl(t)
 	node, err := strata.Open(strata.Config{
 		DataDir:            dir,
-		ObjectStore:        faulty,
+		ObjectStore:        tracked,
 		NodeID:             "upload-test",
 		PeerListenAddr:     peerAddr,
 		AdvertisePeerAddr:  peerAddr,
@@ -1015,7 +1010,7 @@ func TestLocalWALUploadedOnLeaderElection(t *testing.T) {
 	// ── Phase 3: fresh node must see all data ─────────────────────────────────
 	fresh, err := strata.Open(strata.Config{
 		DataDir:     t.TempDir(),
-		ObjectStore: faulty,
+		ObjectStore: tracked,
 	})
 	if err != nil {
 		t.Fatalf("phase-3 Open: %v", err)

@@ -100,22 +100,41 @@ SST files are stored at `sst/<hash16>/<name>` where `<hash16>` is the first 16 h
 
 ## Leader election
 
-Election uses a last-writer-wins S3 object (`leader-lock`) rather than a consensus protocol or TTL polling.
+Election uses an S3 object (`leader-lock`) with atomic conditional PUT operations rather than a consensus protocol or TTL polling.
 
 **Acquiring the lock:**
-1. Try to read `leader-lock`.
-2. If absent (or from a previous term), write a lock record containing `{node_id, term, leader_addr}`.
-3. Re-read the lock. If it still contains this node's record, the election is won.
+1. Read `leader-lock` and capture its ETag.
+2. If **absent**: issue `PUT` with `If-None-Match: *` (`PutIfAbsent`) — only one concurrent writer can succeed; all others get a precondition failure.
+3. If **present and owned by another node**: become a follower of the lock's recorded address.
+4. If the conditional PUT succeeds, the election is won. `LastSeenNano` is set to `now()` on the winning write, so the fresh leader is immediately visible as "alive" to any follower checking liveness.
 
-**Liveness detection:**
-- Followers detect a dead leader when the WAL gRPC stream fails `FollowerMaxRetries` consecutive times (each attempt has a ~2 s timeout).
-- On failure, the follower increments the term and overwrites the lock. It re-reads to confirm it won, then starts serving as the new leader.
+If the store does not implement the `ConditionalStore` interface (optional; see `pkg/object`), the node falls back to an unconditional write + 100 ms read-back to detect a race. All provided stores (`S3Store`, `Mem`) implement `ConditionalStore`.
+
+**TakeOver (follower promoting itself):**
+1. Follower detects a dead leader when the WAL gRPC stream fails `FollowerMaxRetries` consecutive times.
+2. Before attempting takeover, the follower reads the current lock. If `LastSeenNano` is younger than `LeaderLivenessTTL` (3 × `FollowerRetryInterval` = 6 s), the leader was recently alive — the follower is an isolated minority and backs off.
+3. If the lock has already advanced to a term higher than the follower's `floorTerm` (another candidate already won), the follower backs off and follows the new winner.
+4. Otherwise: read the lock ETag, then `PUT` with `If-Match: <etag>`. Only the candidate that read the same ETag wins; all others get a precondition failure and re-read to find the new leader.
 
 **Stepdown:**
-- The old leader periodically re-reads the lock (`LeaderWatchInterval`, default 5 min).
-- If the lock no longer points to this node, it steps down gracefully.
+- On every follower disconnect the leader immediately fences all writes (`fenceMu` write-lock), reads the S3 lock **with its ETag**, and — if still the owner — writes a **liveness touch** (`LastSeenNano = now()`) using `If-Match: <etag>` (conditional PUT). This closes the Read→Touch race: if a follower won a TakeOver between the leader's Read and Touch, the conditional PUT fails with `ErrPreconditionFailed` and the leader steps down immediately, without a second round-trip.
+- Polling (fence + conditional-check + conditional-touch every `FollowerRetryInterval` = 2 s) continues until at least one follower reconnects; once followers are present, polling pauses — liveness is signalled implicitly by the live stream.
+- As a backstop, the leader re-reads the lock on the `LeaderWatchInterval` (default 5 min) periodic ticker even when no disconnect has occurred.
+- If the lock no longer points to this node at any check (or the conditional touch is rejected), it steps down.
 
-There is no heartbeat, no TTL, and no ZooKeeper-style session. The only S3 writes for election are at startup and on takeover. A node that is partitioned from S3 will keep serving reads and local writes until it detects the supersession.
+**S3 request budget during a disconnect event:**  
+Each poll tick costs 1 GET + 1 PUT (touch). With a `FollowerRetryInterval` of 2 s, that is at most 1 GET + 1 PUT per 2 s while a follower is disconnected. Polling stops as soon as any follower reconnects. Outside of disconnect events (and the periodic ticker) there are zero additional S3 requests on the write path.
+
+There is no heartbeat, no TTL, and no ZooKeeper-style session. The only S3 writes for election outside of disconnect events are at election time and on takeover.
+
+### CAP properties
+
+Strata is an **AP** system (Available + Partition-tolerant, not Consistent under partitions):
+
+- **No network partition**: reads are linearizable (followers use the ReadIndex pattern — they sync to the leader's revision before serving). Writes are always routed to the leader.
+- **Under network partition**: when a follower is fully isolated (can't reach leader or other followers), it will eventually TakeOver once `LastSeenNano` goes stale. The old leader detects supersession either via its next conditional liveness touch (which fails with `ErrPreconditionFailed` the instant a new leader writes the lock) or within one poll interval (≤ 2 s). **The split-brain window is effectively zero**: the conditional touch means A cannot refresh its liveness after B wins — A's next touch attempt is rejected and triggers immediate stepdown. The window is zero when the leader still has other followers (follower backs off via liveness touch).
+
+**Known limitation:** a fully isolated old leader (partitioned from both all followers and S3) will continue to accept writes until it can reach S3. Making Strata CP under partitions would require quorum writes (majority acknowledgment before commit) — a Raft/Paxos-level redesign. The current design deliberately prioritises simplicity and availability.
 
 ---
 

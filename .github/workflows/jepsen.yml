@@ -1,0 +1,16 @@
+name: Jepsen
+
+on:
+  push:
+    paths:
+      - "jepsen/**"
+    branches:
+      - main
+  pull_request:
+    paths:
+      - "jepsen/**"
+  workflow_dispatch:
+
+jobs:
+  jepsen:
+    uses: ./.github/workflows/jepsen-workflow.yml

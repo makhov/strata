@@ -13,14 +13,26 @@ import (
 )
 
 // Range implements KVServer.Range (Get / List).
-func (s *Server) Range(_ context.Context, r *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
+func (s *Server) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
 	key := string(r.Key)
 	rangeEnd := string(r.RangeEnd)
+
+	// A read is linearizable when the client requests it AND the server is not
+	// configured to force serializable reads.
+	linearizable := !r.Serializable && s.node.ReadConsistency() != strata.ReadConsistencySerializable
 
 	// Single-key lookup.
 	if rangeEnd == "" {
 		if r.CountOnly {
-			kv, err := s.node.Get(key)
+			var (
+				kv  *strata.KeyValue
+				err error
+			)
+			if linearizable {
+				kv, err = s.node.LinearizableGet(ctx, key)
+			} else {
+				kv, err = s.node.Get(key)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -30,7 +42,15 @@ func (s *Server) Range(_ context.Context, r *etcdserverpb.RangeRequest) (*etcdse
 			}
 			return &etcdserverpb.RangeResponse{Header: s.header(), Count: count}, nil
 		}
-		kv, err := s.node.Get(key)
+		var (
+			kv  *strata.KeyValue
+			err error
+		)
+		if linearizable {
+			kv, err = s.node.LinearizableGet(ctx, key)
+		} else {
+			kv, err = s.node.Get(key)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -50,14 +70,30 @@ func (s *Server) Range(_ context.Context, r *etcdserverpb.RangeRequest) (*etcdse
 	}
 
 	if r.CountOnly {
-		count, err := s.node.Count(prefix)
+		var (
+			count int64
+			err   error
+		)
+		if linearizable {
+			count, err = s.node.LinearizableCount(ctx, prefix)
+		} else {
+			count, err = s.node.Count(prefix)
+		}
 		if err != nil {
 			return nil, err
 		}
 		return &etcdserverpb.RangeResponse{Header: s.header(), Count: count}, nil
 	}
 
-	all, err := s.node.List(prefix)
+	var (
+		all []*strata.KeyValue
+		err error
+	)
+	if linearizable {
+		all, err = s.node.LinearizableList(ctx, prefix)
+	} else {
+		all, err = s.node.List(prefix)
+	}
 	if err != nil {
 		return nil, err
 	}

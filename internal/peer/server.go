@@ -19,6 +19,10 @@ import (
 //   - A bounded ring buffer of recent entries for follower catch-up.
 //   - A map of per-follower channels for live fan-out.
 //   - A ForwardHandler that processes write RPCs forwarded by followers.
+//   - A DisconnectC channel that receives a notification whenever any follower
+//     disconnects unexpectedly. Graceful disconnects (preceded by a GoodBye RPC)
+//     do not signal DisconnectC because there is no split-brain risk from a
+//     follower that voluntarily shut down.
 //
 // Thread safety: Broadcast and Follow both hold mu.
 type Server struct {
@@ -26,14 +30,56 @@ type Server struct {
 	buf            *entryBuffer
 	followers      map[string]chan *wal.Entry
 	forwardHandler ForwardHandler
+
+	// startRev is the first revision this leader will ever write — i.e.
+	// db.CurrentRevision()+1 at the moment becomeLeader ran.  A follower that
+	// connects with FromRevision < startRev has missed entries that are only
+	// in S3 (never in this leader's ring buffer) and must re-sync from S3
+	// before it can consume the live stream.
+	startRev int64
+
+	// gracefulGoodbyes tracks followers that sent a GoodBye RPC before
+	// disconnecting. Their stream disconnect will not trigger DisconnectC.
+	gracefulGoodbyes map[string]struct{}
+
+	// shutdownC is closed by BroadcastShutdown to signal all active Follow
+	// loops that the leader is shutting down gracefully.
+	shutdownC chan struct{}
+
+	// DisconnectC receives a struct{} whenever any follower disconnects
+	// unexpectedly (i.e., without a prior GoodBye). The leader uses this to
+	// immediately fence writes and check the S3 lock. Capacity 1 so sends
+	// never block and rapid-fire disconnects coalesce into a single check.
+	DisconnectC chan struct{}
 }
 
 // NewServer creates a Server with a ring buffer of capacity cap.
 func NewServer(cap int) *Server {
 	return &Server{
-		buf:       newEntryBuffer(cap),
-		followers: make(map[string]chan *wal.Entry),
+		buf:              newEntryBuffer(cap),
+		followers:        make(map[string]chan *wal.Entry),
+		gracefulGoodbyes: make(map[string]struct{}),
+		shutdownC:        make(chan struct{}),
+		DisconnectC:      make(chan struct{}, 1),
 	}
+}
+
+// ConnectedFollowers returns the number of followers currently streaming
+// from this leader.
+func (s *Server) ConnectedFollowers() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.followers)
+}
+
+// SetStartRev records the first revision this leader owns — callers pass
+// db.CurrentRevision()+1 immediately after becomeLeader completes its S3
+// replay.  Followers that connect with FromRevision < startRev are missing
+// entries that will never appear in the ring buffer; they must re-sync.
+func (s *Server) SetStartRev(rev int64) {
+	s.mu.Lock()
+	s.startRev = rev
+	s.mu.Unlock()
 }
 
 // SetForwardHandler registers the handler that processes forwarded writes.
@@ -75,6 +121,16 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 	// Holding the lock here means Broadcast also blocks, so entries that arrive
 	// during "snapshot + register" will be in the channel — no gap.
 	s.mu.Lock()
+	// A follower whose FromRevision is below startRev has missed entries that
+	// were committed by a prior leader and replayed from S3 by this leader —
+	// those entries are in Pebble but will never appear in the ring buffer.
+	// The follower must re-sync from S3 before it can consume the live stream.
+	if s.startRev > 0 && req.FromRevision < s.startRev {
+		s.mu.Unlock()
+		logrus.Warnf("peer: follower %q needs resync (fromRev=%d < leaderStartRev=%d)",
+			req.NodeID, req.FromRevision, s.startRev)
+		return ErrResyncRequired
+	}
 	snapshot, ok := s.buf.since(req.FromRevision)
 	if !ok {
 		s.mu.Unlock()
@@ -93,6 +149,20 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 	defer func() {
 		s.mu.Lock()
 		delete(s.followers, req.NodeID)
+		graceful := false
+		if _, ok := s.gracefulGoodbyes[req.NodeID]; ok {
+			delete(s.gracefulGoodbyes, req.NodeID)
+			graceful = true
+		}
+		// Only trigger split-brain fencing for unexpected disconnects.
+		// A graceful GoodBye means the follower is shutting down intentionally
+		// and will not attempt a TakeOver.
+		if !graceful {
+			select {
+			case s.DisconnectC <- struct{}{}:
+			default:
+			}
+		}
 		s.mu.Unlock()
 	}()
 
@@ -120,6 +190,13 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 			if err := stream.Send(EntryToMsg(e)); err != nil {
 				return err
 			}
+		case <-s.shutdownC:
+			// Leader is shutting down gracefully. Send a shutdown signal to the
+			// follower so it starts a TakeOver immediately.
+			msg := &WalEntryMsg{Shutdown: true}
+			_ = stream.Send(msg) // best-effort; follower will also detect stream close
+			logrus.Infof("peer: sent shutdown signal to follower %q", req.NodeID)
+			return nil
 		case <-stream.Context().Done():
 			logrus.Infof("peer: follower %q disconnected", req.NodeID)
 			return stream.Context().Err()
@@ -127,8 +204,31 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 	}
 }
 
-// Forward implements WalStreamServer. It proxies a write from a follower to
-// the ForwardHandler (the leader Node).
+// GoodBye implements WalStreamServer. Called by a follower before graceful
+// shutdown. Recording the nodeID here prevents the subsequent stream disconnect
+// from triggering split-brain fencing machinery.
+func (s *Server) GoodBye(_ context.Context, req *GoodByeRequest) (*GoodByeResponse, error) {
+	s.mu.Lock()
+	s.gracefulGoodbyes[req.NodeID] = struct{}{}
+	s.mu.Unlock()
+	logrus.Infof("peer: follower %q sent goodbye (graceful shutdown)", req.NodeID)
+	return &GoodByeResponse{}, nil
+}
+
+// BroadcastShutdown sends a shutdown signal to all connected followers so they
+// start a TakeOver election immediately without waiting for retry exhaustion.
+// Called by the leader during graceful shutdown, before stopping the gRPC server.
+func (s *Server) BroadcastShutdown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-s.shutdownC:
+		// already closed
+	default:
+		close(s.shutdownC)
+		logrus.Infof("peer: broadcasting shutdown to %d follower(s)", len(s.followers))
+	}
+}
 func (s *Server) Forward(ctx context.Context, req *ForwardRequest) (*ForwardResponse, error) {
 	s.mu.Lock()
 	h := s.forwardHandler

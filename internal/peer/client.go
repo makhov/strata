@@ -13,6 +13,18 @@ import (
 	"github.com/makhov/strata/internal/wal"
 )
 
+// FollowerRetryInterval is the backoff between consecutive stream reconnect
+// attempts. Exported so the leader's watchLoop can use the same value when
+// computing how long to poll S3 after a follower disconnect.
+const FollowerRetryInterval = 2 * time.Second
+
+// LeaderLivenessTTL is the maximum age of a lock record's LastSeenNano for
+// which a follower will back off from attempting TakeOver. The leader refreshes
+// LastSeenNano at most every FollowerRetryInterval while it has connected
+// followers, so a record younger than this means the leader was alive recently.
+// Using 3× the touch interval gives tolerance for timing jitter and S3 latency.
+const LeaderLivenessTTL = 3 * FollowerRetryInterval // 6 seconds
+
 // Client is the follower-side peer client.
 //
 // It maintains a single persistent gRPC ClientConn to the leader that is
@@ -76,6 +88,7 @@ func (c *Client) getConn() (*grpc.ClientConn, error) {
 //   - ctx.Err() on context cancellation.
 //   - ErrResyncRequired when the leader's buffer no longer covers fromRev.
 //   - ErrLeaderUnreachable after maxRetries consecutive connection failures.
+//   - ErrLeaderShutdown when the leader sent a graceful shutdown signal.
 func (c *Client) Follow(ctx context.Context, fromRev int64, applyFn func(wal.Entry) error) error {
 	consecutiveFailures := 0
 	for {
@@ -86,6 +99,11 @@ func (c *Client) Follow(ctx context.Context, fromRev int64, applyFn func(wal.Ent
 		}
 		if IsResyncRequired(err) {
 			logrus.Errorf("peer: leader requires resync from rev=%d: %v", fromRev, err)
+			return err
+		}
+		// Leader is shutting down: skip retry wait and signal caller to elect now.
+		if IsLeaderShutdown(err) {
+			logrus.Infof("peer: leader sent graceful shutdown — starting election immediately")
 			return err
 		}
 
@@ -103,7 +121,7 @@ func (c *Client) Follow(ctx context.Context, fromRev int64, applyFn func(wal.Ent
 
 		logrus.Warnf("peer: stream error (attempt %d): %v", consecutiveFailures, err)
 		select {
-		case <-time.After(2 * time.Second):
+		case <-time.After(FollowerRetryInterval):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -133,11 +151,28 @@ func (c *Client) followOnce(ctx context.Context, fromRev int64, applyFn func(wal
 		if err != nil {
 			return fromRev, err
 		}
+		if msg.Shutdown {
+			return fromRev, ErrLeaderShutdown
+		}
 		e := MsgToEntry(msg)
 		if err := applyFn(e); err != nil {
 			return fromRev, err
 		}
 		fromRev = e.Revision + 1
+	}
+}
+
+// GoodBye notifies the leader that this follower is shutting down gracefully.
+// The leader will skip split-brain fencing when this follower's stream closes.
+// Best-effort: errors are logged but not returned.
+func (c *Client) GoodBye(ctx context.Context) {
+	conn, err := c.getConn()
+	if err != nil {
+		logrus.Warnf("peer: goodbye: connect: %v", err)
+		return
+	}
+	if _, err := NewWalStreamClient(conn).GoodBye(ctx, &GoodByeRequest{NodeID: c.nodeID}); err != nil {
+		logrus.Warnf("peer: goodbye: rpc: %v", err)
 	}
 }
 

@@ -6,6 +6,9 @@ on:
   workflow_dispatch: # allow manual trigger
 
 jobs:
+  jepsen:
+    uses: ./.github/workflows/jepsen-workflow.yml
+
   stress:
     name: Stress (30m)
     runs-on: ubuntu-latest
