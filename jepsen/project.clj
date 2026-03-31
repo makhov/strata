@@ -13,8 +13,8 @@
   :jvm-opts
   ["-Djava.awt.headless=true"
    ;; Knossos WGL checker is memory-hungry for large histories; 4 GB keeps it
-   ;; from OOM-ing on ~400-op runs that include nemesis operations.
-   "-Xmx2g"
+   ;; from OOM-ing on runs that include nemesis-induced timeout (:info) ops.
+   "-Xmx4g"
    ;; jetcd uses Netty which reflectively accesses JDK internals on Java 17+.
    "--add-opens=java.base/java.lang=ALL-UNNAMED"
    "--add-opens=java.base/java.nio=ALL-UNNAMED"

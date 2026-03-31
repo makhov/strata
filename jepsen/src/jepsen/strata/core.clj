@@ -153,7 +153,7 @@
     :default :register
     :parse-fn keyword]
    [nil "--nemesis NAME"
-    "Nemesis: none | partition-halves | kill | partition-minio (default: partition-halves)"
+    "Nemesis: none | partition-halves | kill | partition-minio (default: kill)"
     :default :partition-halves
     :parse-fn keyword]])
 

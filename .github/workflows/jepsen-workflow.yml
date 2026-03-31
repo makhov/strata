@@ -1,0 +1,56 @@
+name: Jepsen (reusable)
+
+on:
+  workflow_call:
+
+jobs:
+  jepsen:
+    name: Jepsen (${{ matrix.nemesis }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        nemesis: [partition-halves, kill, partition-minio]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SSH keys
+        run: make -C jepsen keys
+
+      - name: Build images
+        run: docker compose -f jepsen/docker-compose.yml build
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - name: Start infrastructure
+        run: |
+          docker compose -f jepsen/docker-compose.yml up -d \
+            minio minio-init n1 n2 n3 n4 n5
+          docker compose -f jepsen/docker-compose.yml \
+            wait minio-init || true
+
+      - name: Run Jepsen (${{ matrix.nemesis }}, 60 s)
+        run: |
+          docker compose -f jepsen/docker-compose.yml run --rm control \
+            lein run -- test \
+              --nodes        n1,n2,n3,n4,n5 \
+              --username     root \
+              --ssh-private-key /root/.ssh/id_ed25519 \
+              --workload     register \
+              --nemesis      ${{ matrix.nemesis }} \
+              --time-limit   60 \
+              --concurrency  3
+
+      - name: Upload Jepsen store
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-store-${{ matrix.nemesis }}-${{ github.sha }}
+          path: jepsen/store/
+          retention-days: 30
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f jepsen/docker-compose.yml down -v
