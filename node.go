@@ -144,9 +144,15 @@ type Node struct {
 
 	entriesSinceCheckpoint int64
 	checkpointTriggerC     chan struct{} // non-nil when CheckpointEntries > 0; signals entry-count-based checkpoint
-	cancelBg               context.CancelFunc
-	closeOnce              sync.Once
-	closed                 atomic.Bool
+	// bgCtx is cancelled by cancelBg — either on Close() or when fencedCheck
+	// detects that this node has been superseded as leader. When cancelled with
+	// leaderCli still nil, the node is shutting down or has been fenced; reads
+	// must return an error instead of serving data from stale local Pebble.
+	bgCtx    context.Context
+	cancelBg context.CancelFunc
+
+	closeOnce sync.Once
+	closed    atomic.Bool
 	bgWg                   sync.WaitGroup // tracks long-running background goroutines (followLoop, checkpointLoop)
 	readWg                 sync.WaitGroup // tracks in-flight read operations; waited before db.Close()
 }
@@ -364,6 +370,7 @@ func Open(cfg Config) (*Node, error) {
 		term:        term,
 		db:          db,
 		wal:         w,
+		bgCtx:       bgCtx,
 		cancelBg:    bgCancel,
 		nextRev:     db.CurrentRevision(),
 		pending:     make(map[string]pendingKV),
@@ -1003,6 +1010,13 @@ func (n *Node) ReadConsistency() ReadConsistency { return n.cfg.ReadConsistency 
 func (n *Node) syncWithLeader(ctx context.Context) error {
 	cli := n.leaderCli.Load()
 	if cli == nil {
+		// If the background context has been cancelled the node is either
+		// shutting down or has been fenced (leader superseded by a new term).
+		// Serving a read from our local stale Pebble would violate
+		// linearizability — return an error so the client retries elsewhere.
+		if n.bgCtx.Err() != nil {
+			return ErrClosed
+		}
 		return nil // leader or single-node — already up-to-date
 	}
 	resp, err := cli.ForwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardGetRevision})
