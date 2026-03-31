@@ -13,6 +13,7 @@
 (def log-file    "/var/log/strata.log")
 (def pid-file    "/var/run/strata.pid")
 (def metrics-port 2380)   ; HTTP /healthz — distinct from the gRPC port (2379)
+(def peer-port   3380)    ; leader→follower WAL stream (peer gRPC)
 
 ;; ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -72,13 +73,22 @@
        :chdir   "/tmp"}
       binary
       :run
-      :--listen        "0.0.0.0:2379"
-      :--data-dir      data-dir
-      :--node-id       (node-id node)
-      :--s3-endpoint   "http://minio:9000"
-      :--s3-bucket     "jepsen"
-      :--metrics-addr  (str "0.0.0.0:" metrics-port)
-      :--log-level     "warn")))
+      :--listen              "0.0.0.0:2379"
+      :--data-dir            data-dir
+      :--node-id             (node-id node)
+      :--s3-endpoint         "http://minio:9000"
+      :--s3-bucket           "jepsen"
+      :--metrics-addr        (str "0.0.0.0:" metrics-port)
+      ;; Enable multi-node mode: nodes elect a leader via S3 and replicate
+      ;; WAL entries over a peer gRPC stream.  Without these flags every node
+      ;; runs in single-node (roleSingle) mode with no replication, making
+      ;; cross-node operations inconsistent from Knossos's perspective.
+      :--peer-listen         (str "0.0.0.0:" peer-port)
+      :--advertise-peer      (str (name node) ":" peer-port)
+      ;; Shorten the leader-watch interval so a zombie/split-brain leader is
+      ;; detected within ~10 s instead of the default 5 minutes.
+      :--leader-watch-interval-sec 10
+      :--log-level           "warn")))
 
 (defn stop!
   [test node]

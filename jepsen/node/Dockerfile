@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /strata ./cmd/strata
+RUN echo 4 && CGO_ENABLED=0 GOOS=linux go build -trimpath -o /strata ./cmd/strata
 
 # ── Stage 2: minimal runtime node ────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -34,6 +34,6 @@ RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
 
 COPY --from=builder /strata /usr/local/bin/strata
 
-EXPOSE 22 2379
+EXPOSE 22 2379 3380
 
 CMD ["/usr/sbin/sshd", "-D", "-e"]
