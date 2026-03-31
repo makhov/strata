@@ -764,12 +764,11 @@ func (n *Node) followLoop(bgCtx context.Context) {
 				n.cancelBg()
 				return
 			}
-			// Re-sync from S3 in-process. First, check whether the follower is
-			// below the latest S3 checkpoint — if so, the WAL segments covering
-			// the gap may have been GC'd and a plain replayRemote would silently
-			// skip those revisions, leaving permanent holes. Restore from the
-			// checkpoint in-place before replaying any remaining WAL entries.
-			logrus.Warn("strata: follower resync required — checking for checkpoint gap")
+			// Ring buffer miss: the follower has been offline long enough that
+			// the leader's ring buffer no longer covers fromRev. Restore from
+			// the latest S3 checkpoint (if the follower's Pebble is behind it),
+			// then replay any remaining WAL entries from S3.
+			logrus.Warn("strata: follower resync required — restoring from checkpoint")
 			if cpErr := n.resyncFromCheckpoint(bgCtx); cpErr != nil {
 				logrus.Errorf("strata: follower in-place resync failed: %v — cancelling", cpErr)
 				n.cancelBg()
@@ -1780,9 +1779,6 @@ func (n *Node) checkpointLoop(ctx context.Context) {
 // forceCheckpoint writes a checkpoint unconditionally (bypassing the
 // entriesSinceCheckpoint guard). Used on startup to capture local state.
 func (n *Node) forceCheckpoint(ctx context.Context) {
-	if n.closed.Load() {
-		return
-	}
 	rev := n.db.CurrentRevision()
 	if rev == 0 {
 		return
@@ -1801,14 +1797,6 @@ func (n *Node) forceCheckpoint(ctx context.Context) {
 }
 
 func (n *Node) maybeCheckpoint(ctx context.Context) {
-	// If Close() has been called we're shutting down. Writing a checkpoint now
-	// would update manifest/latest from a stale (or inconsistent) Pebble state
-	// — e.g. the old leader committing in-flight writes after being superseded
-	// but before cancelBg() fires. Any such checkpoint would corrupt the
-	// manifest and cause subsequent resyncs to restore missing data.
-	if n.closed.Load() {
-		return
-	}
 	if atomic.LoadInt64(&n.entriesSinceCheckpoint) == 0 {
 		return
 	}
