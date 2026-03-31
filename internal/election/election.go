@@ -138,6 +138,18 @@ func (l *Lock) Read(ctx context.Context) (*LockRecord, error) {
 	return cur.rec, nil
 }
 
+// ReadETag returns the current lock record together with the S3 ETag of the
+// object.  The ETag can be passed to TouchIfMatch to make the subsequent
+// liveness touch conditional, closing the Read→Touch race.
+// Returns ("", nil, nil) if the lock object is absent.
+func (l *Lock) ReadETag(ctx context.Context) (*LockRecord, string, error) {
+	cur, err := l.readWithETag(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return cur.rec, cur.etag, nil
+}
+
 // readWithETag reads the lock and returns it together with its ETag.
 func (l *Lock) readWithETag(ctx context.Context) (*lockWithETag, error) {
 	if l.conditional != nil {
@@ -253,4 +265,30 @@ func (l *Lock) Touch(ctx context.Context, term uint64, leaderAddr string) error 
 		LastSeenNano: time.Now().UnixNano(),
 	}
 	return l.write(ctx, rec)
+}
+
+// TouchIfMatch is like Touch but uses a conditional PUT (If-Match: <etag>)
+// so that the write is atomic with respect to the preceding Read.
+//
+// If another node wrote the lock between the caller's Read and this call,
+// the store returns ErrPreconditionFailed, which is returned unwrapped so
+// the caller can detect supersession without a second round-trip.
+//
+// Falls back to unconditional Touch when the store does not support
+// conditional writes (etag == "" or no ConditionalStore).
+func (l *Lock) TouchIfMatch(ctx context.Context, term uint64, leaderAddr, etag string) error {
+	if l.conditional == nil || etag == "" {
+		return l.Touch(ctx, term, leaderAddr)
+	}
+	rec := &LockRecord{
+		NodeID:       l.nodeID,
+		Term:         term,
+		LeaderAddr:   leaderAddr,
+		LastSeenNano: time.Now().UnixNano(),
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return l.conditional.PutIfMatch(ctx, LockKey, bytes.NewReader(b), etag)
 }

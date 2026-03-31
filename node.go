@@ -623,6 +623,11 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 	// When touch is true and still leader, also writes LastSeenNano to the lock
 	// so disconnected followers see a fresh liveness signal and back off TakeOver.
 	//
+	// The Read and the Touch (when requested) are tied together via a conditional
+	// PUT (If-Match: <etag>): if another node wins the lock between our Read and
+	// our Touch, TouchIfMatch returns ErrPreconditionFailed and we step down
+	// immediately — closing the Read→Touch split-brain race.
+	//
 	// NOTE: fenceMu is released explicitly (not via defer) so that grpcSrv.Stop()
 	// can be called outside the lock.  grpc.Server.Stop waits for in-flight
 	// handlers to finish; those handlers (Put/Create/…) acquire fenceMu.RLock()
@@ -630,7 +635,7 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 	fencedCheck := func(reason string, touch bool) bool {
 		n.fenceMu.Lock()
 		rCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		rec, err := lock.Read(rCtx)
+		rec, etag, err := lock.ReadETag(rCtx)
 		cancel()
 		if err != nil {
 			n.fenceMu.Unlock()
@@ -652,10 +657,22 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 		}
 		if touch && n.peerSrv != nil {
 			tCtx, tCancel := context.WithTimeout(ctx, 5*time.Second)
-			if err := lock.Touch(tCtx, term, n.cfg.AdvertisePeerAddr); err != nil {
+			err := lock.TouchIfMatch(tCtx, term, n.cfg.AdvertisePeerAddr, etag)
+			tCancel()
+			if errors.Is(err, object.ErrPreconditionFailed) {
+				// Another node wrote the lock between our Read and our Touch —
+				// we have been superseded.  Step down immediately.
+				logrus.Errorf("strata: leader watch (%s): touch precondition failed — lock taken, stepping down", reason)
+				n.cancelBg()
+				n.fenceMu.Unlock()
+				if grpcSrv := n.peerGRPC; grpcSrv != nil {
+					grpcSrv.Stop()
+				}
+				return false
+			}
+			if err != nil {
 				logrus.Warnf("strata: leader watch (%s): touch lock: %v", reason, err)
 			}
-			tCancel()
 		}
 		n.fenceMu.Unlock()
 		return true
