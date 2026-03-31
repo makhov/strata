@@ -9,8 +9,39 @@ import (
 	"github.com/makhov/strata/pkg/object"
 )
 
+// ReadConsistency controls the consistency guarantee for read operations served
+// by the etcd adapter. It acts as a server-side override on top of the per-request
+// Serializable flag sent by etcd clients.
+type ReadConsistency string
+
+const (
+	// ReadConsistencyLinearizable (default) respects each request's Serializable
+	// flag: linearizable requests use the ReadIndex pattern (follower syncs to the
+	// leader's revision before serving); serializable requests are served locally
+	// without any leader contact.
+	ReadConsistencyLinearizable ReadConsistency = "linearizable"
+
+	// ReadConsistencySerializable forces all reads to be served from the local
+	// Pebble store, bypassing the ReadIndex sync even when the client requests
+	// linearizability. Reads are fast (~450 ns on a single node) and scale
+	// horizontally, but a follower may return data that is slightly behind the
+	// leader. Choose this when throughput and horizontal read scaling matter more
+	// than strict linearizability (e.g., when each API server has a dedicated
+	// strata leader).
+	ReadConsistencySerializable ReadConsistency = "serializable"
+)
+
+
 // Config holds all configuration for a Node.
 type Config struct {
+	// ── Read consistency ─────────────────────────────────────────────────────
+
+	// ReadConsistency controls the consistency guarantee for reads served
+	// through the etcd adapter.
+	// Default: ReadConsistencyLinearizable (etcd-compatible; free for
+	// leaders and single-node deployments since the sync is a no-op).
+	ReadConsistency ReadConsistency
+
 	// ── Storage ──────────────────────────────────────────────────────────────
 
 	// DataDir is the directory used for local Pebble data and WAL segments.
@@ -101,6 +132,9 @@ type Config struct {
 }
 
 func (c *Config) setDefaults() {
+	if c.ReadConsistency == "" {
+		c.ReadConsistency = ReadConsistencyLinearizable
+	}
 	if c.SegmentMaxSize == 0 {
 		c.SegmentMaxSize = 50 << 20
 	}

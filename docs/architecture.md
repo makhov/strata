@@ -112,10 +112,28 @@ Election uses a last-writer-wins S3 object (`leader-lock`) rather than a consens
 - On failure, the follower increments the term and overwrites the lock. It re-reads to confirm it won, then starts serving as the new leader.
 
 **Stepdown:**
-- The old leader periodically re-reads the lock (`LeaderWatchInterval`, default 5 min).
-- If the lock no longer points to this node, it steps down gracefully.
+- On every follower disconnect the leader immediately fences all writes (`fenceMu` write-lock, ~50ms), reads S3 to confirm it still holds the lock, then writes a **liveness touch** (`LastSeenNano = now()`) if other followers are still connected. This signals "I'm alive" so the disconnected follower sees a fresh record and backs off from TakeOver.
+- After the immediate check the leader enters a grace-window poll: it repeats the fence+check+touch every `FollowerRetryInterval` (2 s) for `(FollowerMaxRetries+1) × FollowerRetryInterval` total. This keeps `LastSeenNano` continuously refreshed while the leader is alive.
+- If the grace window ends with zero followers still connected, polling continues indefinitely (the leader has no other way to broadcast liveness; it must detect a completed TakeOver via S3 reads).
+- As a backstop, the leader also re-reads the lock on the `LeaderWatchInterval` (default 5 min) periodic ticker.
+- If the lock no longer points to this node at any check, it steps down and releases the lock.
 
-There is no heartbeat, no TTL, and no ZooKeeper-style session. The only S3 writes for election are at startup and on takeover. A node that is partitioned from S3 will keep serving reads and local writes until it detects the supersession.
+**Follower back-off:**  
+Before calling `TakeOver`, a follower reads the current lock. If `LastSeenNano` is younger than `LeaderLivenessTTL` (3 × `FollowerRetryInterval` = 6 s), the leader was alive recently and still has connected followers — the calling follower is an isolated minority node. It backs off and retries the stream connection instead of attempting a takeover. Once `LastSeenNano` goes stale (leader dead or partitioned from all followers), the follower proceeds with TakeOver normally.
+
+**S3 request budget during a disconnect event:**  
+Each fence window costs 1 GET + 1 PUT (touch). With a 12 s grace window and 2 s intervals, that is at most 6 × (GET + PUT) = 12 requests per disconnect event. Outside of disconnect events there are zero additional requests beyond the periodic ticker.
+
+There is no heartbeat, no TTL, and no ZooKeeper-style session. The only S3 writes for election outside of disconnect events are at startup and on takeover.
+
+### CAP properties
+
+Strata is an **AP** system (Available + Partition-tolerant, not Consistent under partitions):
+
+- **No network partition**: reads are linearizable (followers use the ReadIndex pattern — they sync to the leader's revision before serving). Writes are always routed to the leader.
+- **Under network partition**: when a follower is fully isolated (can't reach leader or other followers), it will eventually TakeOver once `LastSeenNano` goes stale. Write fencing ensures the old leader detects the new term within one poll interval (≤ 2 s) and steps down. The split-brain window is bounded to ≤ 2 s in the common case, and zero when the leader still has other followers (follower backs off via liveness touch).
+
+**Known limitation:** a fully isolated old leader (partitioned from both all followers and S3) will continue to accept writes until it can reach S3. Making Strata CP under partitions would require quorum writes (majority acknowledgment before commit) — a Raft/Paxos-level redesign. The current design deliberately prioritises simplicity and availability.
 
 ---
 

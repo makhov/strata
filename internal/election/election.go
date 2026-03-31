@@ -26,9 +26,10 @@ const LockKey = "leader-lock"
 
 // LockRecord is the content of the leader-lock object.
 type LockRecord struct {
-	NodeID     string `json:"node_id"`
-	Term       uint64 `json:"term"`
-	LeaderAddr string `json:"leader_addr"` // follower peer-stream address
+	NodeID       string `json:"node_id"`
+	Term         uint64 `json:"term"`
+	LeaderAddr   string `json:"leader_addr"`    // follower peer-stream address
+	LastSeenNano int64  `json:"last_seen_nano"` // Unix ns; set by leader on liveness touch
 }
 
 // Lock manages leader election via a single S3 object.
@@ -149,4 +150,19 @@ func (l *Lock) write(ctx context.Context, rec *LockRecord) error {
 		return fmt.Errorf("election: write lock: %w", err)
 	}
 	return nil
+}
+
+// Touch updates LastSeenNano on the lock record to signal that this node is
+// still the active leader. It must only be called when the caller has already
+// verified (via Read) that it still holds the lock with the given term — i.e.,
+// under the leader's fenceMu write-lock. No additional read-back is performed
+// because the term check was just done by the caller.
+func (l *Lock) Touch(ctx context.Context, term uint64, leaderAddr string) error {
+	rec := &LockRecord{
+		NodeID:       l.nodeID,
+		Term:         term,
+		LeaderAddr:   leaderAddr,
+		LastSeenNano: time.Now().UnixNano(),
+	}
+	return l.write(ctx, rec)
 }

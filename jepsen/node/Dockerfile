@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       sudo \
+      awscli \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/run/sshd
 

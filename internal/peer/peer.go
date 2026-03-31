@@ -28,6 +28,11 @@ var ErrResyncRequired = status.Error(codes.FailedPrecondition, "resync_required"
 // consecutive connection failures. The follower should attempt a TakeOver.
 var ErrLeaderUnreachable = status.Error(codes.Unavailable, "leader_unreachable")
 
+// ErrLeaderShutdown is returned by Client.Follow when the leader sends a
+// graceful shutdown signal. The follower should start a TakeOver immediately
+// without waiting for the normal retry cycle to exhaust.
+var ErrLeaderShutdown = status.Error(codes.Unavailable, "leader_shutdown")
+
 // IsResyncRequired reports whether err is an ErrResyncRequired signal.
 func IsResyncRequired(err error) bool {
 	return status.Code(err) == codes.FailedPrecondition
@@ -37,6 +42,12 @@ func IsResyncRequired(err error) bool {
 func IsLeaderUnreachable(err error) bool {
 	s, ok := status.FromError(err)
 	return ok && s.Code() == codes.Unavailable && s.Message() == "leader_unreachable"
+}
+
+// IsLeaderShutdown reports whether err is an ErrLeaderShutdown signal.
+func IsLeaderShutdown(err error) bool {
+	s, ok := status.FromError(err)
+	return ok && s.Code() == codes.Unavailable && s.Message() == "leader_shutdown"
 }
 
 // ── JSON codec ────────────────────────────────────────────────────────────────
@@ -57,6 +68,8 @@ type FollowRequest struct {
 }
 
 // WalEntryMsg is the wire representation of a wal.Entry.
+// Shutdown is a special flag: when true the leader is shutting down gracefully
+// and the follower should start a TakeOver election immediately.
 type WalEntryMsg struct {
 	Revision       int64  `json:"revision"`
 	Term           uint64 `json:"term"`
@@ -66,6 +79,7 @@ type WalEntryMsg struct {
 	Lease          int64  `json:"lease"`
 	CreateRevision int64  `json:"create_revision"`
 	PrevRevision   int64  `json:"prev_revision"`
+	Shutdown       bool   `json:"shutdown,omitempty"`
 }
 
 func EntryToMsg(e *wal.Entry) *WalEntryMsg {
@@ -95,6 +109,7 @@ const (
 	ForwardUpdate                     // CAS update by revision
 	ForwardDeleteIfRevision           // CAS delete by revision (revision=0 = unconditional)
 	ForwardCompact                    // compact up to Revision
+	ForwardGetRevision                // ReadIndex: returns the leader's current revision
 )
 
 // KVMsg is the wire representation of a key-value record.
@@ -131,12 +146,22 @@ type ForwardHandler interface {
 	HandleForward(ctx context.Context, req *ForwardRequest) (*ForwardResponse, error)
 }
 
+// GoodByeRequest is sent by a follower to the leader on graceful shutdown.
+// The leader uses this to skip split-brain fencing for an intentional disconnect.
+type GoodByeRequest struct {
+	NodeID string `json:"node_id"`
+}
+
+// GoodByeResponse is the leader's acknowledgement of a follower's GoodBye.
+type GoodByeResponse struct{}
+
 // ── gRPC service interfaces ───────────────────────────────────────────────────
 
 // WalStreamServer is implemented by the leader (peer/server.go).
 type WalStreamServer interface {
 	Follow(*FollowRequest, WalStream_FollowServer) error
 	Forward(context.Context, *ForwardRequest) (*ForwardResponse, error)
+	GoodBye(context.Context, *GoodByeRequest) (*GoodByeResponse, error)
 }
 
 // WalStream_FollowServer is the server-side send stream.
@@ -153,6 +178,7 @@ func (x *walStream_FollowServer) Send(m *WalEntryMsg) error { return x.ServerStr
 type WalStreamClient interface {
 	Follow(ctx context.Context, req *FollowRequest, opts ...grpc.CallOption) (WalStream_FollowClient, error)
 	Forward(ctx context.Context, req *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error)
+	GoodBye(ctx context.Context, req *GoodByeRequest, opts ...grpc.CallOption) (*GoodByeResponse, error)
 }
 
 // WalStream_FollowClient is the client-side receive stream.
@@ -176,6 +202,7 @@ func (x *walStream_FollowClient) Recv() (*WalEntryMsg, error) {
 const (
 	followMethod  = "/peer.WalStream/Follow"
 	forwardMethod = "/peer.WalStream/Forward"
+	goodByeMethod = "/peer.WalStream/GoodBye"
 )
 
 // NewWalStreamClient wraps a gRPC ClientConn.
@@ -203,6 +230,14 @@ func (c *walStreamClientImpl) Follow(ctx context.Context, req *FollowRequest, op
 func (c *walStreamClientImpl) Forward(ctx context.Context, req *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error) {
 	out := new(ForwardResponse)
 	if err := c.cc.Invoke(ctx, forwardMethod, req, out, opts...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *walStreamClientImpl) GoodBye(ctx context.Context, req *GoodByeRequest, opts ...grpc.CallOption) (*GoodByeResponse, error) {
+	out := new(GoodByeResponse)
+	if err := c.cc.Invoke(ctx, goodByeMethod, req, out, opts...); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -236,11 +271,27 @@ func walStreamForwardHandler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
+func walStreamGoodByeHandler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GoodByeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WalStreamServer).GoodBye(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: goodByeMethod}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WalStreamServer).GoodBye(ctx, req.(*GoodByeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 var walStreamServiceDesc = grpc.ServiceDesc{
 	ServiceName: "peer.WalStream",
 	HandlerType: (*WalStreamServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{MethodName: "Forward", Handler: walStreamForwardHandler},
+		{MethodName: "GoodBye", Handler: walStreamGoodByeHandler},
 	},
 	Streams: []grpc.StreamDesc{
 		{StreamName: "Follow", Handler: walStreamFollowHandler, ServerStreams: true},

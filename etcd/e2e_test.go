@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -359,5 +360,101 @@ func TestE2EThreeNode(t *testing.T) {
 	gr, err = newLeaderCli.Get(ctx, "/cluster/after-failover")
 	if err != nil || len(gr.Kvs) != 1 {
 		t.Errorf("read after failover: err=%v kvs=%v", err, gr.Kvs)
+	}
+}
+
+// ── etcd-protocol benchmarks ──────────────────────────────────────────────────
+//
+// These measure the full stack: etcd v3 client → gRPC → strata etcd adapter →
+// Node → Pebble.  Numbers are directly comparable to etcd's own benchmarks run
+// with `benchmark --endpoints=... put` / `benchmark get`.
+
+func openBenchSingle(b *testing.B) (*strata.Node, *clientv3.Client) {
+	b.Helper()
+	node, err := strata.Open(strata.Config{DataDir: b.TempDir()})
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	b.Cleanup(func() { node.Close() })
+	ep := startEtcdServer(b, node)
+	cli := newEtcdClient(b, ep)
+	return node, cli
+}
+
+// BenchmarkEtcdPut measures single-key Put latency through the full gRPC stack.
+func BenchmarkEtcdPut(b *testing.B) {
+	_, cli := openBenchSingle(b)
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := cli.Put(ctx, fmt.Sprintf("/bench/%d", i), "value"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkEtcdPutParallel measures Put throughput with 16 concurrent writers.
+func BenchmarkEtcdPutParallel(b *testing.B) {
+	_, cli := openBenchSingle(b)
+	ctx := context.Background()
+	var counter atomic.Int64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			i := counter.Add(1)
+			if _, err := cli.Put(ctx, fmt.Sprintf("/bench/par/%d", i), "value"); err != nil {
+				b.Error(err)
+			}
+		}
+	})
+}
+
+// BenchmarkEtcdGetSerializable measures Get latency with r.Serializable=true
+// (local Pebble read, no ReadIndex sync).
+func BenchmarkEtcdGetSerializable(b *testing.B) {
+	_, cli := openBenchSingle(b)
+	ctx := context.Background()
+	if _, err := cli.Put(ctx, "/bench/key", "value"); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := cli.Get(ctx, "/bench/key", clientv3.WithSerializable()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkEtcdGetLinearizable measures Get latency with the default linearizable
+// mode.  On a single-node leader the ReadIndex sync is a no-op, so this shows
+// pure gRPC + Pebble overhead without the extra follower RPC.
+func BenchmarkEtcdGetLinearizable(b *testing.B) {
+	_, cli := openBenchSingle(b)
+	ctx := context.Background()
+	if _, err := cli.Put(ctx, "/bench/key", "value"); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := cli.Get(ctx, "/bench/key"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkEtcdList measures List (prefix scan of 100 keys) latency.
+func BenchmarkEtcdList(b *testing.B) {
+	_, cli := openBenchSingle(b)
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		if _, err := cli.Put(ctx, fmt.Sprintf("/bench/list/%04d", i), "v"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := cli.Get(ctx, "/bench/list/", clientv3.WithPrefix(), clientv3.WithSerializable()); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

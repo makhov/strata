@@ -71,6 +71,7 @@
        :pidfile pid-file
        :chdir   "/tmp"}
       binary
+      :run
       :--listen        "0.0.0.0:2379"
       :--data-dir      data-dir
       :--node-id       (node-id node)
@@ -83,11 +84,24 @@
   [test node]
   (c/su (cu/stop-daemon! binary pid-file)))
 
+(defn wipe-s3!
+  "Removes all objects in the shared S3 bucket. Called once (from the first
+  node only) to avoid concurrent delete races."
+  []
+  (c/su
+    (c/exec :aws :--endpoint-url "http://minio:9000"
+            :s3 :rm (str "s3://jepsen/") :--recursive
+            (c/lit "; true"))))
+
 (defn wipe!
   [test node]
   (c/su
     (c/exec :rm :-rf data-dir)
-    (c/exec :mkdir :-p data-dir)))
+    (c/exec :mkdir :-p data-dir))
+  ;; Clear shared S3 state once, from the first node only.
+  (when (= node (first (sort (:nodes test))))
+    (install-aws-credentials!)
+    (wipe-s3!)))
 
 ;; ── DB record ─────────────────────────────────────────────────────────────────
 

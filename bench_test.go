@@ -3,12 +3,15 @@ package strata_test
 import (
 	"context"
 	"fmt"
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/makhov/strata"
+	"github.com/makhov/strata/pkg/object"
 )
 
 func openBenchNode(b *testing.B) *strata.Node {
@@ -223,5 +226,106 @@ func BenchmarkWatch(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		n.Put(ctx, fmt.Sprintf("/bench/watch/%d", i), []byte("v"), 0)
 		<-ch
+	}
+}
+
+// freeBenchAddr allocates a free TCP port for benchmark use.
+func freeBenchAddr(b *testing.B) string {
+	b.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("freeBenchAddr: %v", err)
+	}
+	addr := lis.Addr().String()
+	lis.Close()
+	return addr
+}
+
+// BenchmarkGetSerializable is the baseline: single-node local read, no sync RPC.
+func BenchmarkGetSerializable(b *testing.B) {
+	n := openBenchNode(b)
+	ctx := context.Background()
+	if _, err := n.Put(ctx, "/bench/get", []byte("value"), 0); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := n.Get("/bench/get"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGetLinearizableLeader measures LinearizableGet on the leader (sync
+// is a no-op) to confirm zero overhead over a plain Get.
+func BenchmarkGetLinearizableLeader(b *testing.B) {
+	n := openBenchNode(b)
+	ctx := context.Background()
+	if _, err := n.Put(ctx, "/bench/get", []byte("value"), 0); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := n.LinearizableGet(ctx, "/bench/get"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGetLinearizableFollower measures the full ReadIndex cost on a
+// follower: ForwardGetRevision RPC to leader + local Pebble read.
+// This is the realistic overhead for linearizable reads in a multi-node cluster.
+func BenchmarkGetLinearizableFollower(b *testing.B) {
+	store := object.NewMem()
+	ctx := context.Background()
+
+	leaderAddr := freeBenchAddr(b)
+	leader, err := strata.Open(strata.Config{
+		DataDir:        b.TempDir(),
+		ObjectStore:    store,
+		NodeID:         "bench-leader",
+		PeerListenAddr: leaderAddr,
+	})
+	if err != nil {
+		b.Fatalf("open leader: %v", err)
+	}
+	b.Cleanup(func() { leader.Close() })
+
+	follower, err := strata.Open(strata.Config{
+		DataDir:     b.TempDir(),
+		ObjectStore: store,
+		NodeID:      "bench-follower",
+		PeerListenAddr: freeBenchAddr(b),
+	})
+	if err != nil {
+		b.Fatalf("open follower: %v", err)
+	}
+	b.Cleanup(func() { follower.Close() })
+
+	// wait for leader election
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if leader.IsLeader() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !leader.IsLeader() {
+		b.Fatal("leader not elected within 10s")
+	}
+
+	rev, err := leader.Put(ctx, "/bench/get", []byte("value"), 0)
+	if err != nil {
+		b.Fatalf("leader Put: %v", err)
+	}
+	if err := follower.WaitForRevision(ctx, rev); err != nil {
+		b.Fatalf("follower catch-up: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := follower.LinearizableGet(ctx, "/bench/get"); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

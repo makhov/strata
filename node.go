@@ -104,6 +104,20 @@ type Node struct {
 	// mu serialises all leader writes for CAS safety and role transitions.
 	mu sync.Mutex
 
+	// fenceMu is a read-write mutex used to briefly pause leader writes while
+	// the node verifies it is still the elected leader (after a follower
+	// disconnects). Write methods hold RLock for their full duration; the
+	// watchLoop holds Lock while performing the S3 lock check so that writes
+	// are drained and no new ones start until the check completes.
+	fenceMu sync.RWMutex
+
+	// writeTouchC is a coalescing signal channel. When the node is leader with
+	// zero followers connected, commitLoop sends a signal here after every
+	// successful commit. watchLoop drains it and performs a fencedCheck+Touch
+	// so LastSeenNano stays fresh even between 2-second polling ticks.
+	// Capacity 1: rapid writes coalesce to a single S3 op.
+	writeTouchC chan struct{}
+
 	// nextRev is the last revision assigned to a write. Incremented under mu
 	// before the entry is sent to the commit loop. Replaces n.db.CurrentRevision()+1
 	// on the write path so that in-flight entries have distinct revisions.
@@ -252,6 +266,7 @@ func Open(cfg Config) (*Node, error) {
 
 	w, err := wal.Open(walDir, term, startRev+1,
 		wal.WithUploader(uploader),
+		wal.WithSyncUpload(),
 		wal.WithSegmentMaxSize(cfg.SegmentMaxSize),
 		wal.WithSegmentMaxAge(cfg.SegmentMaxAge),
 	)
@@ -321,6 +336,7 @@ func Open(cfg Config) (*Node, error) {
 				w.Close()
 				freshW, rerr := wal.Open(walDir, newTerm, newRev+1,
 					wal.WithUploader(uploader),
+					wal.WithSyncUpload(),
 					wal.WithSegmentMaxSize(cfg.SegmentMaxSize),
 					wal.WithSegmentMaxAge(cfg.SegmentMaxAge),
 				)
@@ -344,14 +360,15 @@ func Open(cfg Config) (*Node, error) {
 
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	n := &Node{
-		cfg:      cfg,
-		term:     term,
-		db:       db,
-		wal:      w,
-		cancelBg: bgCancel,
-		nextRev:  db.CurrentRevision(),
-		pending:  make(map[string]pendingKV),
-		writeC:   make(chan *writeReq, 1024),
+		cfg:         cfg,
+		term:        term,
+		db:          db,
+		wal:         w,
+		cancelBg:    bgCancel,
+		nextRev:     db.CurrentRevision(),
+		pending:     make(map[string]pendingKV),
+		writeC:      make(chan *writeReq, 1024),
+		writeTouchC: make(chan struct{}, 1),
 	}
 	if cfg.CheckpointEntries > 0 {
 		n.checkpointTriggerC = make(chan struct{}, 1)
@@ -494,6 +511,7 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 
 	w2, err := wal.Open(walDir, rec.Term, n.db.CurrentRevision()+1,
 		wal.WithUploader(makeUploader(n.cfg.ObjectStore)),
+		wal.WithSyncUpload(),
 		wal.WithSegmentMaxSize(n.cfg.SegmentMaxSize),
 		wal.WithSegmentMaxAge(n.cfg.SegmentMaxAge),
 	)
@@ -548,25 +566,139 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 // watchLoop periodically reads the lock from S3 to detect supersession.
 // Steps down (cancelBg) if the lock's term or owner changes.
 // On clean shutdown, releases the lock.
+//
+// Split-brain prevention strategy:
+//
+//  1. On any follower disconnect: immediately fence writes (~50ms), read S3 to
+//     confirm still leader, then write a liveness Touch (LastSeenNano=now) if
+//     other followers are still connected. The Touch signals "I'm alive" so the
+//     disconnected follower backs off from TakeOver if it reads the lock.
+//
+//  2. Keep polling + touching every peer.FollowerRetryInterval during the grace
+//     window (FollowerMaxRetries+1 intervals). This refreshes LastSeenNano so
+//     the disconnected follower always sees a fresh record while the leader is
+//     alive. Each poll fences writes only for its ~50ms duration (GET + PUT).
+//     If the grace window ends while 0 followers are connected, polling
+//     continues indefinitely — the leader has no way to broadcast liveness, so
+//     it must detect a completed TakeOver via S3 reads as quickly as possible.
+//
+//  3. Periodic fallback: LeaderWatchInterval as a last resort (single-node mode
+//     or any edge case where no disconnect event was observed).
+//     where no follower was connected (single-node mode, etc.).
 func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) {
 	ticker := time.NewTicker(n.cfg.LeaderWatchInterval)
 	defer ticker.Stop()
+
+	// Grace window: time until a disconnected follower can call TakeOver.
+	followerTakeoverGrace := time.Duration(n.cfg.FollowerMaxRetries+1) * peer.FollowerRetryInterval
+
+	// Disconnect channel from the peer server, if we're running in multi-node mode.
+	var disconnectC <-chan struct{}
+	if n.peerSrv != nil {
+		disconnectC = n.peerSrv.DisconnectC
+	}
+
+	// pollC / pollStop manage an active polling window after a disconnect.
+	// Both are nil when no polling is in progress (nil channels block in select).
+	var (
+		activePollTicker *time.Ticker
+		pollC            <-chan time.Time
+		pollStop         <-chan time.Time
+	)
+
+	stopPolling := func() {
+		if activePollTicker != nil {
+			activePollTicker.Stop()
+			activePollTicker = nil
+		}
+		pollC = nil
+		pollStop = nil
+	}
+
+	startPolling := func() {
+		stopPolling()
+		activePollTicker = time.NewTicker(peer.FollowerRetryInterval)
+		pollC = activePollTicker.C
+		pollStop = time.After(followerTakeoverGrace)
+	}
+
+	// fencedCheck fences all leader writes for the duration of one S3 GET (and
+	// optional PUT). Returns false and steps down if the lock has been superseded.
+	// When touch is true and still leader, also writes LastSeenNano to the lock
+	// so disconnected followers see a fresh liveness signal and back off TakeOver.
+	fencedCheck := func(reason string, touch bool) bool {
+		n.fenceMu.Lock()
+		defer n.fenceMu.Unlock()
+		rCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		rec, err := lock.Read(rCtx)
+		cancel()
+		if err != nil {
+			logrus.Warnf("strata: leader watch (%s): read lock: %v", reason, err)
+			return true // transient S3 error; keep running
+		}
+		if rec == nil || rec.Term != term || rec.NodeID != n.cfg.NodeID {
+			logrus.Errorf("strata: leader watch (%s): lock superseded (current: %+v) — stepping down", reason, rec)
+			n.cancelBg()
+			return false
+		}
+		if touch && n.peerSrv != nil {
+			tCtx, tCancel := context.WithTimeout(ctx, 5*time.Second)
+			if err := lock.Touch(tCtx, term, n.cfg.AdvertisePeerAddr); err != nil {
+				logrus.Warnf("strata: leader watch (%s): touch lock: %v", reason, err)
+			}
+			tCancel()
+		}
+		return true
+	}
+
 	for {
 		select {
-		case <-ticker.C:
-			rCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			rec, err := lock.Read(rCtx)
-			cancel()
-			if err != nil {
-				logrus.Warnf("strata: leader watch: read lock: %v", err)
-				continue
-			}
-			if rec == nil || rec.Term != term || rec.NodeID != n.cfg.NodeID {
-				logrus.Errorf("strata: leader watch: lock superseded (current: %+v) — stepping down", rec)
-				n.cancelBg()
+		case <-n.writeTouchC:
+			// A write just committed with no followers connected — touch the lock
+			// so any follower considering TakeOver sees a fresh LastSeenNano and
+			// backs off. Rapid writes coalesce into one S3 op via the capacity-1 channel.
+			if !fencedCheck("write-touch", true) {
 				return
 			}
+
+		case <-ticker.C:
+			if !fencedCheck("periodic", false) {
+				return
+			}
+
+		case <-disconnectC:
+			// Immediate check + touch: catches TakeOver that already happened,
+			// and signals liveness to the disconnected follower.
+			logrus.Infof("strata: leader watch: follower disconnected — fencing writes and checking lock")
+			if !fencedCheck("disconnect", true) {
+				return
+			}
+			// Begin polling so we keep refreshing LastSeenNano and detect
+			// any TakeOver that happens after our immediate check.
+			// A new disconnect resets the window.
+			startPolling()
+
+		case <-pollC:
+			if !fencedCheck("disconnect-poll", true) {
+				stopPolling()
+				return
+			}
+
+		case <-pollStop:
+			// Grace window elapsed. If followers are still gone, keep polling
+			// so LastSeenNano stays fresh-or-absent and we catch a late TakeOver.
+			// If a follower reconnected, the risk has passed — revert to the
+			// periodic ticker.
+			if n.peerSrv != nil && n.peerSrv.ConnectedFollowers() == 0 {
+				logrus.Debugf("strata: leader watch: grace window elapsed, no followers — continuing poll")
+				startPolling()
+			} else {
+				logrus.Debugf("strata: leader watch: post-disconnect grace window elapsed — resuming normal watch")
+				stopPolling()
+			}
+
 		case <-ctx.Done():
+			stopPolling()
 			rCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			lock.Release(rCtx)
 			cancel()
@@ -606,8 +738,12 @@ func (n *Node) followLoop(bgCtx context.Context) {
 			return
 		}
 
-		if peer.IsLeaderUnreachable(err) {
-			logrus.Warn("strata: leader unreachable — attempting election takeover")
+		if peer.IsLeaderUnreachable(err) || peer.IsLeaderShutdown(err) {
+			if peer.IsLeaderShutdown(err) {
+				logrus.Info("strata: leader shut down gracefully — attempting immediate election takeover")
+			} else {
+				logrus.Warn("strata: leader unreachable — attempting election takeover")
+			}
 			newCli, promoted := n.attemptPromotion(bgCtx, lock)
 			if promoted {
 				return
@@ -634,10 +770,30 @@ func (n *Node) followLoop(bgCtx context.Context) {
 // attemptPromotion tries to take over the leader lock after the stream dies.
 // Returns (nil, true) if promoted to leader.
 // Returns (newClient, false) if another node won; newClient follows that node.
-// Returns (nil, false) on S3 errors.
+// Returns (nil, false) on S3 errors or when the current leader's liveness
+// record is fresh enough that TakeOver would risk a split-brain.
 func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock) (*peer.Client, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// Read the current lock before attempting TakeOver. If the leader recently
+	// wrote a liveness touch (LastSeenNano is fresh), it still has other
+	// followers and we are an isolated minority node — back off to prevent
+	// split-brain. The leader refreshes LastSeenNano every FollowerRetryInterval
+	// while it has followers, so a record younger than LeaderLivenessTTL means
+	// the leader was alive within the last few seconds.
+	existing, err := lock.Read(ctx)
+	if err != nil {
+		logrus.Errorf("strata: takeover: read lock: %v", err)
+		return nil, false
+	}
+	if existing != nil && existing.LastSeenNano > 0 {
+		age := time.Since(time.Unix(0, existing.LastSeenNano))
+		if age < peer.LeaderLivenessTTL {
+			logrus.Infof("strata: takeover: leader liveness is fresh (%v ago) — backing off to avoid split-brain", age.Round(time.Millisecond))
+			return nil, false
+		}
+	}
 
 	rec, won, err := lock.TakeOver(ctx, n.term)
 	if err != nil {
@@ -701,6 +857,18 @@ func (n *Node) HandleForward(ctx context.Context, req *peer.ForwardRequest) (*pe
 		err := n.Compact(ctx, req.Revision)
 		code, msg := encodeErr(err)
 		return &peer.ForwardResponse{Succeeded: err == nil, ErrCode: code, ErrMsg: msg}, nil
+
+	case peer.ForwardGetRevision:
+		// Return nextRev (the highest *assigned* revision), not db.CurrentRevision()
+		// (the last *applied* revision). A write increments nextRev under n.mu and
+		// sends to writeC before the commit loop applies it to Pebble. If we returned
+		// db.CurrentRevision() here, a follower could sync to a revision that precedes
+		// an in-flight write whose acknowledgment is about to be sent to the client —
+		// causing a stale read that violates linearizability.
+		n.mu.Lock()
+		rev := n.nextRev
+		n.mu.Unlock()
+		return &peer.ForwardResponse{Revision: rev, Succeeded: true}, nil
 	}
 	return nil, fmt.Errorf("strata: unknown forward op %d", req.Op)
 }
@@ -731,6 +899,8 @@ func fwdOpLabel(op peer.ForwardOp) string {
 		return "delete"
 	case peer.ForwardCompact:
 		return "compact"
+	case peer.ForwardGetRevision:
+		return "get_revision"
 	default:
 		return "unknown"
 	}
@@ -779,11 +949,76 @@ func msgToKV(m *peer.KVMsg) *KeyValue {
 	}
 }
 
+// ReadConsistency returns the configured read consistency mode.
+func (n *Node) ReadConsistency() ReadConsistency { return n.cfg.ReadConsistency }
+
+// syncWithLeader implements the ReadIndex pattern: ask the leader for its
+// current revision, then wait until this node has applied at least that far.
+// Returns nil immediately if the node is the leader or running single-node.
+func (n *Node) syncWithLeader(ctx context.Context) error {
+	cli := n.leaderCli.Load()
+	if cli == nil {
+		return nil // leader or single-node — already up-to-date
+	}
+	resp, err := cli.ForwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardGetRevision})
+	if err != nil {
+		return fmt.Errorf("strata: read sync: %w", err)
+	}
+	return n.WaitForRevision(ctx, resp.Revision)
+}
+
+// LinearizableGet returns the value for key with linearizability guaranteed.
+// On a follower it syncs to the leader's revision before serving locally.
+func (n *Node) LinearizableGet(ctx context.Context, key string) (*KeyValue, error) {
+	if err := n.syncWithLeader(ctx); err != nil {
+		return nil, err
+	}
+	return n.Get(key)
+}
+
+// LinearizableList returns all keys with the given prefix with linearizability guaranteed.
+func (n *Node) LinearizableList(ctx context.Context, prefix string) ([]*KeyValue, error) {
+	if err := n.syncWithLeader(ctx); err != nil {
+		return nil, err
+	}
+	return n.List(prefix)
+}
+
+// LinearizableCount returns the count of keys with the given prefix with linearizability guaranteed.
+func (n *Node) LinearizableCount(ctx context.Context, prefix string) (int64, error) {
+	if err := n.syncWithLeader(ctx); err != nil {
+		return 0, err
+	}
+	return n.Count(prefix)
+}
+
 // Close shuts down the node cleanly.
 func (n *Node) Close() error {
 	var err error
 	n.closeOnce.Do(func() {
 		n.closed.Store(true)
+
+		// Graceful goodbye signals — sent before cancelling context so the RPCs
+		// can complete on a still-running connection.
+		//
+		// Follower: tell the leader this disconnect is intentional so it skips
+		// split-brain fencing machinery.
+		//
+		// Leader: tell all followers to start election immediately so they don't
+		// wait FollowerMaxRetries × FollowerRetryInterval before taking over.
+		switch n.loadRole() {
+		case roleFollower:
+			if cli := n.peerCli; cli != nil {
+				gCtx, gCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				cli.GoodBye(gCtx)
+				gCancel()
+			}
+		case roleLeader:
+			if n.peerSrv != nil {
+				n.peerSrv.BroadcastShutdown()
+			}
+		}
+
 		n.cancelBg()
 		if cli := n.leaderCli.Load(); cli != nil {
 			cli.Close()
@@ -831,6 +1066,8 @@ func (n *Node) Put(ctx context.Context, key string, value []byte, lease int64) (
 		}
 		return resp.Revision, decodeErr(resp.ErrCode, resp.ErrMsg)
 	}
+	n.fenceMu.RLock()
+	defer n.fenceMu.RUnlock()
 	start := time.Now()
 	n.mu.Lock()
 	if n.closed.Load() {
@@ -887,6 +1124,8 @@ func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64
 		}
 		return resp.Revision, decodeErr(resp.ErrCode, resp.ErrMsg)
 	}
+	n.fenceMu.RLock()
+	defer n.fenceMu.RUnlock()
 	start := time.Now()
 	n.mu.Lock()
 	if n.closed.Load() {
@@ -930,6 +1169,8 @@ func (n *Node) Update(ctx context.Context, key string, value []byte, revision, l
 		}
 		return resp.Revision, msgToKV(resp.OldKV), resp.Succeeded, decodeErr(resp.ErrCode, resp.ErrMsg)
 	}
+	n.fenceMu.RLock()
+	defer n.fenceMu.RUnlock()
 	start := time.Now()
 	n.mu.Lock()
 	if n.closed.Load() {
@@ -981,6 +1222,8 @@ func (n *Node) Delete(ctx context.Context, key string) (int64, error) {
 		}
 		return resp.Revision, decodeErr(resp.ErrCode, resp.ErrMsg)
 	}
+	n.fenceMu.RLock()
+	defer n.fenceMu.RUnlock()
 	start := time.Now()
 	n.mu.Lock()
 	if n.closed.Load() {
@@ -1007,6 +1250,8 @@ func (n *Node) DeleteIfRevision(ctx context.Context, key string, revision int64)
 		}
 		return resp.Revision, msgToKV(resp.OldKV), resp.Succeeded, decodeErr(resp.ErrCode, resp.ErrMsg)
 	}
+	n.fenceMu.RLock()
+	defer n.fenceMu.RUnlock()
 	start := time.Now()
 	n.mu.Lock()
 	if n.closed.Load() {
@@ -1230,6 +1475,15 @@ func (n *Node) commitLoop(ctx context.Context) {
 			for _, req := range batch {
 				n.peerSrv.Broadcast(&req.entry)
 			}
+			// With no followers connected, signal watchLoop to Touch the S3 lock
+			// so isolated followers see a fresh LastSeenNano and back off from
+			// TakeOver while writes are actively landing on this leader.
+			if n.peerSrv.ConnectedFollowers() == 0 {
+				select {
+				case n.writeTouchC <- struct{}{}:
+				default:
+				}
+			}
 		}
 
 		// Signal all callers.
@@ -1258,6 +1512,8 @@ func (n *Node) Compact(ctx context.Context, revision int64) error {
 		}
 		return decodeErr(resp.ErrCode, resp.ErrMsg)
 	}
+	n.fenceMu.RLock()
+	defer n.fenceMu.RUnlock()
 	start := time.Now()
 	n.mu.Lock()
 	if n.closed.Load() {
