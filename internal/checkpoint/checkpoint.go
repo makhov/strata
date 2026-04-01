@@ -362,7 +362,9 @@ func ListRemote(ctx context.Context, store object.Store) ([]string, error) {
 // only the most recent `keep` checkpoints. Returns the number deleted.
 //
 // The checkpoint currently referenced by manifest/latest is always preserved
-// even if it would otherwise fall outside the `keep` window.
+// even if it would otherwise fall outside the `keep` window. Checkpoints
+// referenced by active branch entries are also always preserved, since branch
+// nodes need the checkpoint index to call RestoreBranch.
 func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, error) {
 	if keep < 1 {
 		keep = 1
@@ -371,6 +373,17 @@ func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, erro
 	manifest, err := ReadManifest(ctx, store)
 	if err != nil {
 		return 0, fmt.Errorf("checkpoint gc: read manifest: %w", err)
+	}
+
+	branches, err := ReadBranchEntries(ctx, store)
+	if err != nil {
+		return 0, fmt.Errorf("checkpoint gc: read branch entries: %w", err)
+	}
+	pinnedKeys := make(map[string]bool, len(branches))
+	for _, entry := range branches {
+		if entry.AncestorCheckpointKey != "" {
+			pinnedKeys[entry.AncestorCheckpointKey] = true
+		}
 	}
 
 	keys, err := ListRemote(ctx, store)
@@ -385,6 +398,9 @@ func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, erro
 	for _, k := range toDelete {
 		if manifest != nil && k == manifest.CheckpointKey {
 			continue
+		}
+		if pinnedKeys[k] {
+			continue // branch is pinned to this checkpoint; preserve it
 		}
 		if err := deleteCheckpoint(ctx, store, k); err != nil {
 			return deleted, fmt.Errorf("checkpoint gc: delete %q: %w", k, err)

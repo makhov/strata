@@ -184,7 +184,7 @@ Branching lets you fork a database at a checkpoint without copying SST files in 
 1. **Register** — `Fork(ctx, sourceStore, branchID)` reads the latest (or a specified) checkpoint manifest from the source store and writes a `branches/<id>` registry entry to the source store. This entry records the checkpoint key being forked from.
 2. **Start** — Open a new strata node with `BranchPoint{SourceStore, CheckpointKey}`. On first boot, `RestoreBranch` downloads SSTs from the source store and Pebble metadata from the source checkpoint. The branch's own store prefix starts empty.
 3. **Diverge** — New SSTs produced by the branch are uploaded to the branch's own prefix. The checkpoint index for the branch records `SSTFiles` (its own SSTs) and `AncestorSSTFiles` (SSTs inherited from the source). Ancestor SSTs are never re-uploaded.
-4. **GC coordination** — The source's GC phase reads the branch registry and treats all SST keys referenced by any live branch as pinned. SSTs shared between source and branch are never deleted while the branch is registered.
+4. **GC coordination** — The source's GC phase reads the branch registry before deleting anything. `GCCheckpoints` keeps the pinned checkpoint directory (manifest + index) intact even if it falls outside the keep-N window. `GCOrphanSSTs` keeps all SST files referenced by any live branch. Both source checkpoint objects and SSTs are preserved for as long as the branch entry exists.
 5. **Unfork** — `Unfork(ctx, sourceStore, branchID)` removes the registry entry. The next source GC cycle can reclaim SSTs that are no longer referenced by any live checkpoint or branch.
 
 ### Branch registry
