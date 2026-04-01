@@ -148,7 +148,7 @@ type Node struct {
 	closeOnce sync.Once
 	closed    atomic.Bool
 	bgWg      sync.WaitGroup // tracks long-running background goroutines (followLoop, checkpointLoop)
-	readWg    sync.WaitGroup // tracks in-flight read operations; waited before db.Close()
+	readMu    sync.RWMutex   // held RLock by in-flight reads; Lock taken by Close to drain them
 }
 
 func (n *Node) loadRole() nodeRole   { return nodeRole(n.role.Load()) }
@@ -796,6 +796,17 @@ func (n *Node) followLoop(bgCtx context.Context) {
 			if err := n.db.Apply([]wal.Entry{e}); err != nil {
 				return err
 			}
+			// Track the leader's term so attemptPromotion uses the correct
+			// floorTerm when calling TakeOver.  Without this, n.term stays at
+			// its Open() value and TakeOver backs off because it sees the
+			// current lock term as "already taken over at a higher term".
+			if e.Term > n.term {
+				n.mu.Lock()
+				if e.Term > n.term {
+					n.term = e.Term
+				}
+				n.mu.Unlock()
+			}
 			// Advance only after a successful apply so a reconnect retries
 			// the same revision rather than skipping it.
 			fromRev = e.Revision + 1
@@ -850,7 +861,7 @@ func (n *Node) followLoop(bgCtx context.Context) {
 			} else {
 				logrus.Warn("strata: leader unreachable — attempting election takeover")
 			}
-			newCli, promoted := n.attemptPromotion(bgCtx, lock)
+			newCli, promoted := n.attemptPromotion(bgCtx, lock, peer.IsLeaderShutdown(err))
 			if promoted {
 				return
 			}
@@ -878,34 +889,49 @@ func (n *Node) followLoop(bgCtx context.Context) {
 // Returns (newClient, false) if another node won; newClient follows that node.
 // Returns (nil, false) on S3 errors or when the current leader's liveness
 // record is fresh enough that TakeOver would risk a split-brain.
-func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock) (*peer.Client, bool) {
+//
+// graceful should be true when the leader sent an explicit shutdown signal:
+// in that case the liveness check is skipped because the leader intentionally
+// vacated and the fresh LastSeenNano would otherwise block all followers.
+func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, graceful bool) (*peer.Client, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Read the current lock before attempting TakeOver. If the leader recently
-	// wrote a liveness touch (LastSeenNano is fresh), it still has other
-	// followers and we are an isolated minority node — back off to prevent
-	// split-brain. The leader refreshes LastSeenNano every FollowerRetryInterval
-	// while it has followers, so a record younger than LeaderLivenessTTL means
-	// the leader was alive within the last few seconds.
+	// wrote a liveness touch (LastSeenNano is fresh) AND the shutdown was not
+	// graceful, the leader may still have other followers and we are an
+	// isolated minority node — back off to prevent split-brain.
+	// On graceful shutdown we skip this check: the leader intentionally left,
+	// so its fresh LastSeenNano must not block election.
 	existing, err := lock.Read(ctx)
 	if err != nil {
 		logrus.Errorf("strata: takeover: read lock: %v", err)
 		return nil, false
 	}
-	if existing != nil && existing.LastSeenNano > 0 {
+	if !graceful && existing != nil && existing.LastSeenNano > 0 {
 		age := time.Since(time.Unix(0, existing.LastSeenNano))
 		if age < peer.LeaderLivenessTTL {
 			logrus.Infof("strata: takeover: leader liveness is fresh (%v ago) — backing off to avoid split-brain", age.Round(time.Millisecond))
+			// Back off from election, but do not keep retrying a stale endpoint.
+			// If the lock advertises a leader address, switch followLoop to it.
+			if existing.LeaderAddr != "" {
+				return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS), false
+			}
 			return nil, false
 		}
 	}
 	// Revision fence: refuse to become leader if we are behind the last known
 	// committed revision. A node missing entries would either drop them (data
 	// loss) or fail to serve reads that clients already observed.
+	// If the lock already points to a current leader, return their address so
+	// followLoop switches to following them — connecting will trigger an
+	// in-place resync that catches up this node's revision.
 	if existing != nil && existing.CommittedRev > n.db.CurrentRevision() {
-		logrus.Infof("strata: takeover: node is behind leader committed rev (ours=%d, leader=%d) — backing off",
+		logrus.Infof("strata: takeover: node is behind leader committed rev (ours=%d, leader=%d) — following current leader to catch up",
 			n.db.CurrentRevision(), existing.CommittedRev)
+		if existing.LeaderAddr != "" {
+			return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS), false
+		}
 		return nil, false
 	}
 
@@ -1177,9 +1203,14 @@ func (n *Node) Close() error {
 		} else if peerLis != nil {
 			peerLis.Close()
 		}
-		// Wait for any in-flight read operations (Get, List, WaitForRevision)
-		// that passed the n.closed check but haven't called into pebble yet.
-		n.readWg.Wait()
+		// Drain all in-flight read operations (Get, List, WaitForRevision).
+		// Taking the write lock waits for every concurrent RLock holder to
+		// release, and prevents new RLocks from being acquired, so the DB is
+		// not closed under a live reader.  The store's closed channel was
+		// signalled above, so any reader blocked in WaitForRevision will
+		// return ErrClosed and release its RLock promptly.
+		n.readMu.Lock()
+		n.readMu.Unlock()
 		if werr := n.wal.Close(); werr != nil {
 			logrus.Errorf("strata: wal close: %v", werr)
 			err = werr
@@ -1689,8 +1720,8 @@ func (n *Node) Get(key string) (*KeyValue, error) {
 	if n.closed.Load() {
 		return nil, ErrClosed
 	}
-	n.readWg.Add(1)
-	defer n.readWg.Done()
+	n.readMu.RLock()
+	defer n.readMu.RUnlock()
 	if n.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -1705,8 +1736,8 @@ func (n *Node) List(prefix string) ([]*KeyValue, error) {
 	if n.closed.Load() {
 		return nil, ErrClosed
 	}
-	n.readWg.Add(1)
-	defer n.readWg.Done()
+	n.readMu.RLock()
+	defer n.readMu.RUnlock()
 	if n.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -1731,8 +1762,8 @@ func (n *Node) WaitForRevision(ctx context.Context, rev int64) error {
 	if n.closed.Load() {
 		return ErrClosed
 	}
-	n.readWg.Add(1)
-	defer n.readWg.Done()
+	n.readMu.RLock()
+	defer n.readMu.RUnlock()
 	if n.closed.Load() {
 		return ErrClosed
 	}
