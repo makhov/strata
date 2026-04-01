@@ -156,6 +156,52 @@ strata run --metrics-addr 0.0.0.0:9090 ...
 
 ---
 
+## Performance
+
+Numbers are from `go test -bench=. -benchtime=5s` on an Apple M4 Pro (12 cores, NVMe SSD). All tests use in-process loopback — no real network or S3.
+
+### Single-node (no peers, no S3)
+
+Write latency is dominated by a single WAL fsync (~8 ms on NVMe). Concurrent writers are automatically batched by the `commitLoop` into a single fsync per drain cycle (group commit).
+
+| Operation | Throughput | Latency |
+|---|---|---|
+| `Put` (serial) | ~123 writes/s | 8.1 ms |
+| `Put` (12 concurrent writers) | ~750 writes/s | 1.3 ms avg |
+| `Put` (192 concurrent writers) | ~11,600 writes/s | 86 µs avg |
+| `Get` / `LinearizableGet` (leader) | ~2,300,000 reads/s | 0.43 µs |
+| `List` (100 keys) | ~27,900 ops/s | 36 µs |
+
+### 3-node cluster (localhost loopback)
+
+Write latency = leader WAL fsync + quorum ACK round-trip (follower WAL fsync + network). On loopback, both nodes share the same SSD so each write costs roughly two sequential fsyncs (~16 ms).
+
+| Operation | Throughput | Latency |
+|---|---|---|
+| `Put` (serial) | ~43 writes/s | 23 ms |
+| `Put` (12 concurrent writers) | ~224 writes/s | 4.5 ms avg |
+| `LinearizableGet` (follower) | ~18,100 reads/s | 55 µs |
+
+With group commit, the per-write overhead of the quorum ACK round-trip disappears almost entirely under load — 12 concurrent writers improve from 43 to 224 writes/s by batching many writes into one ACK round.
+
+### Impact of real-world latency
+
+Write latency scales with inter-node RTT and S3 latency (single-node only):
+
+| Scenario | Additional latency | Notes |
+|---|---|---|
+| Cluster, same-host loopback | +15 ms | loopback gRPC + follower fsync |
+| Cluster, LAN (1 ms RTT) | +9 ms | ≈ follower fsync + 2× 0.5 ms network |
+| Cluster, cross-AZ (5 ms RTT) | +18 ms | ≈ follower fsync + 2× 5 ms network |
+| Cluster, cross-region (50 ms RTT) | +108 ms | high-latency links hurt serial throughput most |
+| Single-node, S3 upload | +100–500 ms | sync upload per WAL segment — use cluster mode for low latency |
+
+In cluster mode, **S3 uploads are async** (disaster-recovery only) and add zero latency to the write path. Single-node mode uploads each WAL segment to S3 synchronously; write latency is dominated by S3 round-trip, not local fsync. For low-latency single-node deployments without S3, latency is entirely local disk (~8 ms NVMe).
+
+Read latency on a follower includes one `ForwardGetRevision` gRPC call to the leader to obtain the current revision, then a local Pebble lookup. On localhost this costs ~55 µs; on LAN expect ~1–2 ms; on cross-AZ ~10 ms.
+
+---
+
 ## Durability and recovery
 
 ### What is durable
