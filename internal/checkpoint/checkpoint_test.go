@@ -558,6 +558,62 @@ func TestWriteSkipsExistingSSTs(t *testing.T) {
 	}
 }
 
+// listCountingStore wraps a Store and counts calls to List(prefix).
+type listCountingStore struct {
+	object.Store
+	mu     sync.Mutex
+	counts map[string]int // prefix → number of List calls
+}
+
+func (s *listCountingStore) List(ctx context.Context, prefix string) ([]string, error) {
+	s.mu.Lock()
+	s.counts[prefix]++
+	s.mu.Unlock()
+	return s.Store.List(ctx, prefix)
+}
+
+func (s *listCountingStore) listCount(prefix string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[prefix]
+}
+
+// TestWriteNoListAfterFirst verifies that Write does not issue a LIST sst/
+// call on the second and subsequent checkpoints — it uses the previous
+// checkpoint index instead. The only time a LIST is acceptable is on the very
+// first checkpoint of a branch node (before any branch index exists).
+func TestWriteNoListAfterFirst(t *testing.T) {
+	db := openDB(t)
+	inner := object.NewMem()
+	store := &listCountingStore{Store: inner, counts: make(map[string]int)}
+	ctx := context.Background()
+
+	db.Set([]byte("k1"), []byte("v1"), pebble.Sync)
+	if err := checkpoint.Write(ctx, db, store, 1, 1, "", nil); err != nil {
+		t.Fatalf("Write 1: %v", err)
+	}
+	// Reset counts — we only care about subsequent checkpoints.
+	store.mu.Lock()
+	store.counts = make(map[string]int)
+	store.mu.Unlock()
+
+	db.Set([]byte("k2"), []byte("v2"), pebble.Sync)
+	if err := checkpoint.Write(ctx, db, store, 1, 2, "", nil); err != nil {
+		t.Fatalf("Write 2: %v", err)
+	}
+	if n := store.listCount("sst/"); n != 0 {
+		t.Errorf("second checkpoint issued %d LIST sst/ calls, want 0", n)
+	}
+
+	db.Set([]byte("k3"), []byte("v3"), pebble.Sync)
+	if err := checkpoint.Write(ctx, db, store, 1, 3, "", nil); err != nil {
+		t.Fatalf("Write 3: %v", err)
+	}
+	if n := store.listCount("sst/"); n != 0 {
+		t.Errorf("third checkpoint issued %d LIST sst/ calls, want 0", n)
+	}
+}
+
 // TestGCOrphanSSTs verifies that unreferenced SSTs are deleted while SSTs
 // referenced by live checkpoint indexes or branch entries are kept.
 func TestGCOrphanSSTs(t *testing.T) {
