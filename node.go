@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -161,9 +162,8 @@ func Open(cfg Config) (*Node, error) {
 	walDir := filepath.Join(cfg.DataDir, "wal")
 
 	var (
-		startRev  int64
-		term      uint64 = 1
-		freshNode bool   // true when pebble was restored from a checkpoint (not a restart)
+		startRev int64
+		term     uint64 = 1
 	)
 
 	// ── Restore checkpoint ───────────────────────────────────────────────────
@@ -219,7 +219,6 @@ func Open(cfg Config) (*Node, error) {
 					if rerr == nil {
 						term, startRev = t, rev
 						logrus.Infof("strata: checkpoint restored (term=%d rev=%d)", term, startRev)
-						freshNode = true
 						break
 					}
 					if !errors.Is(rerr, object.ErrNotFound) || attempt >= 4 {
@@ -308,52 +307,94 @@ func Open(cfg Config) (*Node, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
-		// Close the GC race: between the initial manifest read and now, the leader
-		// may have written a newer checkpoint and GC'd the WAL segments that span
-		// [startRev+1, newCheckpointRev]. Re-reading the manifest and re-restoring
-		// from the fresher checkpoint means replayRemote only needs segments the
-		// leader hasn't yet deleted.
-		if freshNode {
-			if freshManifest, merr := checkpoint.ReadManifest(ctx, cfg.ObjectStore); merr == nil &&
-				freshManifest != nil && freshManifest.Revision > startRev {
-				logrus.Infof("strata: fresher checkpoint available (rev=%d > startRev=%d); re-restoring to close GC race", freshManifest.Revision, startRev)
-				db.Close()
-				if rerr := os.RemoveAll(pebbleDir); rerr != nil {
-					w.Close()
-					return nil, fmt.Errorf("strata: remove stale pebble dir: %w", rerr)
-				}
-				newTerm, newRev, rerr := checkpoint.Restore(ctx, cfg.ObjectStore, freshManifest.CheckpointKey, pebbleDir)
-				if rerr != nil {
-					w.Close()
-					return nil, fmt.Errorf("strata: re-restore checkpoint: %w", rerr)
-				}
-				freshDB, rerr := istore.Open(pebbleDir)
-				if rerr != nil {
-					w.Close()
-					return nil, fmt.Errorf("strata: reopen store after checkpoint refresh: %w", rerr)
-				}
-				w.Close()
-				freshW, rerr := wal.Open(walDir, newTerm, newRev+1,
-					wal.WithUploader(uploader),
-					wal.WithSyncUpload(),
-					wal.WithSegmentMaxSize(cfg.SegmentMaxSize),
-					wal.WithSegmentMaxAge(cfg.SegmentMaxAge),
-				)
-				if rerr != nil {
-					freshDB.Close()
-					return nil, fmt.Errorf("strata: reopen wal after checkpoint refresh: %w", rerr)
-				}
-				// Use pebble's actual currentRev as startRev (same reasoning as
-				// after the initial pebble open above).
-				db, w, term, startRev = freshDB, freshW, newTerm, freshDB.CurrentRevision()
-				logrus.Infof("strata: checkpoint refreshed to rev=%d (term=%d)", startRev, term)
-			}
-		}
+		// Close the GC race: the leader checkpoints periodically (e.g. every
+		// 400 ms in tests) and immediately GCs WAL segments covered by each
+		// checkpoint. A bootstrapping node that started replaying WAL entries
+		// from S3 can find mid-flight that some earlier segments were deleted
+		// while it was reading later ones. The node then applies the later
+		// segments (advancing currentRev past the gap) and later connects to
+		// the leader with a fromRev that skips the missing range — those keys
+		// are permanently absent.
+		//
+		// The fix: after each replayRemote call, re-read the manifest. If the
+		// checkpoint advanced past startRevBeforeReplay, a GC could have
+		// deleted segments we needed. Restore from the fresher checkpoint and
+		// replay again. Repeat until the checkpoint no longer advances between
+		// the start and end of replayRemote (meaning no GC occurred during the
+		// replay). The loop converges quickly: in the worst case it runs once
+		// per checkpoint interval that fires during replay.
+		for range 10 { // cap at 10 iterations; converges in 1-2 on any real cluster
+			startRevBeforeReplay := db.CurrentRevision()
+			replayErr := replayRemote(ctx, db, cfg.ObjectStore, startRevBeforeReplay)
 
-		if err := replayRemote(ctx, db, cfg.ObjectStore, startRev); err != nil {
-			w.Close()
+			// Always check manifest after replay, even on error: if a WAL
+			// segment was GCed mid-read replayRemote returns ErrNotFound, but
+			// that same GC event means a fresh checkpoint exists.  Re-restoring
+			// from that checkpoint is the correct recovery; returning the error
+			// directly would cause Open() to fail unnecessarily.
+			freshManifest, merr := checkpoint.ReadManifest(ctx, cfg.ObjectStore)
+
+			if replayErr != nil {
+				// If the checkpoint has not advanced there is no recovery path —
+				// this is a genuine storage error.
+				if merr != nil || freshManifest == nil || freshManifest.Revision <= startRevBeforeReplay {
+					w.Close()
+					db.Close()
+					return nil, fmt.Errorf("strata: remote WAL replay: %w", replayErr)
+				}
+				logrus.Infof("strata: WAL replay error (%v), checkpoint advanced (%d→%d) — re-restoring to close GC gap",
+					replayErr, startRevBeforeReplay, freshManifest.Revision)
+			} else if merr != nil || freshManifest == nil || freshManifest.Revision <= startRevBeforeReplay {
+				// Replay succeeded and no checkpoint advancement — no GC gap, done.
+				break
+			} else {
+				// Replay succeeded but checkpoint advanced — silent GC holes possible.
+				logrus.Infof("strata: checkpoint advanced during WAL replay (%d→%d); re-restoring to close GC gap",
+					startRevBeforeReplay, freshManifest.Revision)
+			}
 			db.Close()
-			return nil, fmt.Errorf("strata: remote WAL replay: %w", err)
+			if rerr := os.RemoveAll(pebbleDir); rerr != nil {
+				w.Close()
+				return nil, fmt.Errorf("strata: remove stale pebble dir: %w", rerr)
+			}
+			var newTerm uint64
+			var newRev int64
+			manifest := freshManifest
+			for attempt := range 5 {
+				newTerm, newRev, err = checkpoint.Restore(ctx, cfg.ObjectStore, manifest.CheckpointKey, pebbleDir)
+				if err == nil {
+					break
+				}
+				if !errors.Is(err, object.ErrNotFound) || attempt >= 4 {
+					w.Close()
+					return nil, fmt.Errorf("strata: re-restore checkpoint: %w", err)
+				}
+				time.Sleep(500 * time.Millisecond)
+				manifest, err = checkpoint.ReadManifest(ctx, cfg.ObjectStore)
+				if err != nil || manifest == nil {
+					w.Close()
+					return nil, fmt.Errorf("strata: re-read manifest after GC: %w", err)
+				}
+			}
+			_ = newRev // term drives WAL open; startRev is read from Pebble below
+			freshDB, rerr := istore.Open(pebbleDir)
+			if rerr != nil {
+				w.Close()
+				return nil, fmt.Errorf("strata: reopen store after GC-gap fix: %w", rerr)
+			}
+			w.Close()
+			freshW, rerr := wal.Open(walDir, newTerm, freshDB.CurrentRevision()+1,
+				wal.WithUploader(uploader),
+				wal.WithSyncUpload(),
+				wal.WithSegmentMaxSize(cfg.SegmentMaxSize),
+				wal.WithSegmentMaxAge(cfg.SegmentMaxAge),
+			)
+			if rerr != nil {
+				freshDB.Close()
+				return nil, fmt.Errorf("strata: reopen wal after GC-gap fix: %w", rerr)
+			}
+			db, w, term, startRev = freshDB, freshW, newTerm, freshDB.CurrentRevision()
+			logrus.Infof("strata: checkpoint refreshed to rev=%d (term=%d)", startRev, term)
 		}
 	}
 
@@ -458,7 +499,7 @@ func (n *Node) electAndStart(bgCtx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	rec, won, err := lock.TryAcquire(ctx, n.term)
+	rec, won, err := lock.TryAcquire(ctx, n.term, n.db.CurrentRevision())
 	if err != nil {
 		return fmt.Errorf("strata: election: %w", err)
 	}
@@ -507,7 +548,8 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 
 		reCtx, reCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		if err := replayRemote(reCtx, n.db, n.cfg.ObjectStore, n.db.CurrentRevision()); err != nil {
-			logrus.Warnf("strata: becomeLeader replay remote WAL: %v (proceeding)", err)
+			reCancel()
+			return fmt.Errorf("strata: becomeLeader replay remote WAL: %w", err)
 		}
 		reCancel()
 	}
@@ -625,6 +667,15 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 		pollC = activePollTicker.C
 	}
 
+	// Always start polling immediately in cluster mode so LastSeenNano is
+	// kept fresh from the very first tick, even before any follower connects.
+	// Without this, a leader with no followers never touches the lock and the
+	// liveness record goes stale after LeaderLivenessTTL, letting any
+	// recovering follower win TakeOver and create a split-brain.
+	if n.peerSrv != nil {
+		startPolling()
+	}
+
 	// fencedCheck fences all leader writes for the duration of one S3 GET (and
 	// optional PUT). Returns false and steps down if the lock has been superseded.
 	// When touch is true and still leader, also writes LastSeenNano to the lock
@@ -664,7 +715,7 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 		}
 		if touch && n.peerSrv != nil {
 			tCtx, tCancel := context.WithTimeout(ctx, 5*time.Second)
-			err := lock.TouchIfMatch(tCtx, term, n.cfg.AdvertisePeerAddr, etag)
+			err := lock.TouchIfMatch(tCtx, term, n.cfg.AdvertisePeerAddr, etag, n.db.CurrentRevision())
 			tCancel()
 			if errors.Is(err, object.ErrPreconditionFailed) {
 				// Another node wrote the lock between our Read and our Touch —
@@ -719,9 +770,6 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 
 		case <-ctx.Done():
 			stopPolling()
-			rCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			lock.Release(rCtx)
-			cancel()
 			return
 		}
 	}
@@ -736,6 +784,12 @@ func (n *Node) followLoop(bgCtx context.Context) {
 
 	for {
 		err := cli.Follow(bgCtx, fromRev, func(e wal.Entry) error {
+			// Followers must apply a contiguous revision stream. If the leader
+			// stream skips (or rewinds) a revision, force a full resync rather
+			// than silently advancing currentRev with holes.
+			if e.Revision != fromRev {
+				return peer.ErrResyncRequired
+			}
 			if err := n.wal.Append(&e); err != nil {
 				return err
 			}
@@ -846,8 +900,16 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock) (*pe
 			return nil, false
 		}
 	}
+	// Revision fence: refuse to become leader if we are behind the last known
+	// committed revision. A node missing entries would either drop them (data
+	// loss) or fail to serve reads that clients already observed.
+	if existing != nil && existing.CommittedRev > n.db.CurrentRevision() {
+		logrus.Infof("strata: takeover: node is behind leader committed rev (ours=%d, leader=%d) — backing off",
+			n.db.CurrentRevision(), existing.CommittedRev)
+		return nil, false
+	}
 
-	rec, won, err := lock.TakeOver(ctx, n.term)
+	rec, won, err := lock.TakeOver(ctx, n.term, n.db.CurrentRevision())
 	if err != nil {
 		logrus.Errorf("strata: takeover election error: %v", err)
 		return nil, false
@@ -1122,6 +1184,10 @@ func (n *Node) Close() error {
 			logrus.Errorf("strata: wal close: %v", werr)
 			err = werr
 		}
+		// Intentionally do NOT delete the election lock on shutdown.
+		// A stale lock is safe: followers use TakeOver (term bump) after stream
+		// failure. Deleting here is unsafe because it is not conditional and can
+		// erase a newer leader's lock during overlap/restart races.
 		if dberr := n.db.Close(); dberr != nil {
 			err = dberr
 		}
@@ -2105,6 +2171,7 @@ func replayRemote(ctx context.Context, db *istore.Store, obj object.Store, after
 	// upper bound — apply all entries).
 	cutoff := walTermCutoffs(keys)
 
+	var all []wal.Entry
 	for _, key := range keys {
 		term, _ := parseWALKey(key)
 		termCutoff := cutoff[term]
@@ -2123,7 +2190,6 @@ func replayRemote(ctx context.Context, db *istore.Store, obj object.Store, after
 		if readErr != nil {
 			logrus.Warnf("strata: partial remote segment %q: %v", key, readErr)
 		}
-		var applicable []wal.Entry
 		for _, e := range entries {
 			if e.Revision <= afterRev {
 				continue // already covered by checkpoint / local WAL
@@ -2131,13 +2197,45 @@ func replayRemote(ctx context.Context, db *istore.Store, obj object.Store, after
 			if e.Revision >= termCutoff {
 				continue // superseded by a higher-term entry at this revision
 			}
-			applicable = append(applicable, *e)
+			all = append(all, *e)
 		}
-		if len(applicable) > 0 {
-			if err := db.Recover(applicable); err != nil {
-				return err
+	}
+
+	if len(all) == 0 {
+		return nil
+	}
+
+	// Ensure deterministic order and resolve same-revision duplicates by
+	// keeping the highest-term entry at each revision.
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Revision != all[j].Revision {
+			return all[i].Revision < all[j].Revision
+		}
+		return all[i].Term < all[j].Term
+	})
+	merged := make([]wal.Entry, 0, len(all))
+	for _, e := range all {
+		if n := len(merged); n > 0 && merged[n-1].Revision == e.Revision {
+			if e.Term >= merged[n-1].Term {
+				merged[n-1] = e
 			}
+			continue
 		}
+		merged = append(merged, e)
+	}
+
+	// Fail closed on holes: a missing revision means we likely raced WAL GC
+	// during bootstrap/resync and must restore from a fresher checkpoint.
+	expected := afterRev + 1
+	for _, e := range merged {
+		if e.Revision != expected {
+			return fmt.Errorf("replayRemote: missing revision(s): expected %d got %d", expected, e.Revision)
+		}
+		expected++
+	}
+
+	if err := db.Recover(merged); err != nil {
+		return err
 	}
 	return nil
 }
