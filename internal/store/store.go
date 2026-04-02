@@ -223,9 +223,9 @@ func (s *Store) Recover(entries []wal.Entry) error {
 				r, rerr := unmarshalRecord(old)
 				closer.Close()
 				if rerr == nil && !r.delete && r.key != e.Key {
-					if err := b.Delete(idxKey(r.key), pebble.NoSync); err != nil {
+					if err := b.Delete(curKey(r.key), pebble.NoSync); err != nil {
 						b.Close()
-						return fmt.Errorf("store: cleanup stale idx %q rev=%d: %w", r.key, e.Revision, err)
+						return fmt.Errorf("store: cleanup stale cur %q rev=%d: %w", r.key, e.Revision, err)
 					}
 				}
 			}
@@ -269,14 +269,14 @@ func (s *Store) applyEntry(b *pebble.Batch, e *wal.Entry) error {
 	if err := b.Set(lk, marshalRecord(r), pebble.NoSync); err != nil {
 		return fmt.Errorf("store: set log key rev=%d: %w", e.Revision, err)
 	}
-	ik := idxKey(e.Key)
+	ck := curKey(e.Key)
 	if e.Op == wal.OpDelete {
-		if err := b.Delete(ik, pebble.NoSync); err != nil {
-			return fmt.Errorf("store: delete idx key %q: %w", e.Key, err)
+		if err := b.Delete(ck, pebble.NoSync); err != nil {
+			return fmt.Errorf("store: delete cur key %q: %w", e.Key, err)
 		}
 	} else {
-		if err := b.Set(ik, encodeRev(e.Revision), pebble.NoSync); err != nil {
-			return fmt.Errorf("store: set idx key %q rev=%d: %w", e.Key, e.Revision, err)
+		if err := b.Set(ck, encodeCurValue(e.Revision, r), pebble.NoSync); err != nil {
+			return fmt.Errorf("store: set cur key %q rev=%d: %w", e.Key, e.Revision, err)
 		}
 	}
 	return nil
@@ -306,11 +306,11 @@ func (s *Store) applyCompact(b *pebble.Batch, compactRev int64) error {
 		entryRev := decodeLogKey(iter.Key())
 		r, err := unmarshalRecord(iter.Value())
 		if err == nil && !r.delete {
-			idxRev, err := s.getIdxRev(r.key)
+			curRev, err := s.getCurRev(r.key)
 			if err != nil {
-				return fmt.Errorf("store: compact idx lookup %q: %w", r.key, err)
+				return fmt.Errorf("store: compact cur lookup %q: %w", r.key, err)
 			}
-			if idxRev == entryRev {
+			if curRev == entryRev {
 				continue // live key at its current revision — keep
 			}
 		}
@@ -380,24 +380,26 @@ type KeyValue struct {
 
 // Get returns the current value of key, or nil if not found.
 func (s *Store) Get(key string) (*KeyValue, error) {
-	rev, err := s.getIdxRev(key)
-	if err != nil || rev == 0 {
-		return nil, err
-	}
-	return s.getLogEntry(key, rev)
-}
-
-func (s *Store) getIdxRev(key string) (int64, error) {
-	v, closer, err := s.db.Get(idxKey(key))
-	if err == pebble.ErrNotFound {
-		return 0, nil
+	v, closer, err := s.db.Get(curKey(key))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("store: get idx %q: %w", key, err)
+		return nil, fmt.Errorf("store: get cur %q: %w", key, err)
 	}
-	rev := decodeRev(v)
-	closer.Close()
-	return rev, nil
+	defer closer.Close()
+	return decodeCurValue(key, v)
+}
+
+// getCurRev returns the mod-revision stored in the cur entry for key, or 0 if
+// the key is not present. Used by applyCompact to decide whether a log entry
+// is still the live value of a key.
+func (s *Store) getCurRev(key string) (int64, error) {
+	kv, err := s.Get(key)
+	if err != nil || kv == nil {
+		return 0, err
+	}
+	return kv.Revision, nil
 }
 
 func (s *Store) getLogEntry(key string, rev int64) (*KeyValue, error) {
@@ -423,8 +425,8 @@ func (s *Store) getLogEntry(key string, rev int64) (*KeyValue, error) {
 // List returns all live keys with the given prefix, sorted lexicographically.
 // If prefix is empty, all keys are returned.
 func (s *Store) List(prefix string) ([]*KeyValue, error) {
-	lower := idxKey(prefix)
-	upper := idxKeyUpper(prefix)
+	lower := curKey(prefix)
+	upper := curKeyUpper(prefix)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: lower,
@@ -437,9 +439,8 @@ func (s *Store) List(prefix string) ([]*KeyValue, error) {
 
 	var out []*KeyValue
 	for iter.First(); iter.Valid(); iter.Next() {
-		k := string(iter.Key()[1:]) // strip 'i' prefix
-		rev := decodeRev(iter.Value())
-		kv, err := s.getLogEntry(k, rev)
+		k := string(iter.Key()[1:]) // strip 'c' prefix
+		kv, err := decodeCurValue(k, iter.Value())
 		if err != nil {
 			return nil, err
 		}
@@ -450,8 +451,8 @@ func (s *Store) List(prefix string) ([]*KeyValue, error) {
 
 // Count returns the number of live keys with the given prefix.
 func (s *Store) Count(prefix string) (int64, error) {
-	lower := idxKey(prefix)
-	upper := idxKeyUpper(prefix)
+	lower := curKey(prefix)
+	upper := curKeyUpper(prefix)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: lower,

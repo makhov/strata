@@ -11,12 +11,16 @@ import (
 
 // Key space layout (single-byte prefix preserves lexicographic order):
 //
-//	'l' + rev(8B BE)  → serialised entry  (append-only change log)
-//	'i' + key bytes   → rev(8B BE)         (current modRevision per live key)
-//	'm' + name bytes  → metadata value     (compact rev, current rev, etc.)
+//	'c' + key bytes   → rev(8B BE) + serialised record  (current value per live key)
+//	'l' + rev(8B BE)  → serialised record               (append-only change log)
+//	'm' + name bytes  → metadata value                  (compact rev, current rev, etc.)
+//
+// The 'c' (current) space is the primary read index: a single lookup returns
+// the full KeyValue for any live key. The 'l' (log) space is append-only and
+// used exclusively for watch scans and compaction.
 const (
+	prefixCur  = byte('c')
 	prefixLog  = byte('l')
-	prefixIdx  = byte('i')
 	prefixMeta = byte('m')
 )
 
@@ -31,7 +35,7 @@ var (
 	// Iteration bounds.
 	logLower = []byte{prefixLog, 0, 0, 0, 0, 0, 0, 0, 0}
 	logUpper = []byte{prefixLog + 1}
-	idxUpper = []byte{prefixIdx + 1}
+	curUpper = []byte{prefixCur + 1}
 )
 
 const (
@@ -51,6 +55,57 @@ type record struct {
 }
 
 // logKey encodes a revision as a pebble log key.
+// curKey encodes a key as a pebble 'c' (current) index key.
+func curKey(key string) []byte {
+	k := make([]byte, 1+len(key))
+	k[0] = prefixCur
+	copy(k[1:], key)
+	return k
+}
+
+func curKeyUpper(prefix string) []byte {
+	ub := upperBound([]byte(prefix))
+	if ub == nil {
+		return curUpper
+	}
+	k := make([]byte, 1+len(ub))
+	k[0] = prefixCur
+	copy(k[1:], ub)
+	return k
+}
+
+// encodeCurValue encodes a cur entry as rev(8B BE) + marshalRecord(r).
+// The revision is prepended so a single Pebble read returns both the
+// mod-revision and the full record without a second lookup.
+func encodeCurValue(rev int64, r *record) []byte {
+	rec := marshalRecord(r)
+	b := make([]byte, 8+len(rec))
+	binary.BigEndian.PutUint64(b[:8], uint64(rev))
+	copy(b[8:], rec)
+	return b
+}
+
+// decodeCurValue decodes a cur entry, returning a fully populated KeyValue.
+func decodeCurValue(key string, b []byte) (*KeyValue, error) {
+	if len(b) < 8 {
+		return nil, fmt.Errorf("store: cur value too short (%d bytes)", len(b))
+	}
+	rev := int64(binary.BigEndian.Uint64(b[:8]))
+	r, err := unmarshalRecord(b[8:])
+	if err != nil {
+		return nil, err
+	}
+	return &KeyValue{
+		Key:            key,
+		Value:          r.value,
+		Revision:       rev,
+		CreateRevision: r.createRevision,
+		PrevRevision:   r.prevRevision,
+		Lease:          r.lease,
+	}, nil
+}
+
+// logKey encodes a revision as a pebble log key.
 func logKey(rev int64) []byte {
 	k := make([]byte, 9)
 	k[0] = prefixLog
@@ -60,24 +115,6 @@ func logKey(rev int64) []byte {
 
 func decodeLogKey(k []byte) int64 {
 	return int64(binary.BigEndian.Uint64(k[1:]))
-}
-
-func idxKey(key string) []byte {
-	k := make([]byte, 1+len(key))
-	k[0] = prefixIdx
-	copy(k[1:], key)
-	return k
-}
-
-func idxKeyUpper(prefix string) []byte {
-	ub := upperBound([]byte(prefix))
-	if ub == nil {
-		return idxUpper
-	}
-	k := make([]byte, 1+len(ub))
-	k[0] = prefixIdx
-	copy(k[1:], ub)
-	return k
 }
 
 func upperBound(prefix []byte) []byte {
