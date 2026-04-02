@@ -186,7 +186,7 @@ func (s *Store) Apply(entries []wal.Entry) error {
 			return fmt.Errorf("store: set current rev: %w", err)
 		}
 	}
-	if err := b.Commit(pebble.Sync); err != nil {
+	if err := b.Commit(pebble.NoSync); err != nil {
 		b.Close()
 		return fmt.Errorf("store: commit batch: %w", err)
 	}
