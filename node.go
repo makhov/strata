@@ -786,42 +786,49 @@ func (n *Node) followLoop(bgCtx context.Context) {
 	fromRev := n.db.CurrentRevision() + 1
 
 	for {
-		err := cli.Follow(bgCtx, fromRev, func(entries []wal.Entry) error {
-			// Followers must apply a contiguous revision stream. If the leader
-			// stream skips (or rewinds) a revision, force a full resync rather
-			// than silently advancing currentRev with holes.
-			for i, e := range entries {
-				if e.Revision != fromRev+int64(i) {
-					return peer.ErrResyncRequired
+		err := cli.Follow(
+			bgCtx,
+			fromRev,
+			func(entries []wal.Entry) error {
+				// Followers must apply a contiguous revision stream. If the leader
+				// stream skips (or rewinds) a revision, force a full resync rather
+				// than silently advancing currentRev with holes.
+				for i, e := range entries {
+					if e.Revision != fromRev+int64(i) {
+						return peer.ErrResyncRequired
+					}
 				}
-			}
-			ptrs := make([]*wal.Entry, len(entries))
-			for i := range entries {
-				ptrs[i] = &entries[i]
-			}
-			if err := n.wal.AppendBatch(bgCtx, ptrs); err != nil {
-				return err
-			}
-			if err := n.db.Apply(entries); err != nil {
-				return err
-			}
-			// Track the leader's term so attemptPromotion uses the correct
-			// floorTerm when calling TakeOver.  Without this, n.term stays at
-			// its Open() value and TakeOver backs off because it sees the
-			// current lock term as "already taken over at a higher term".
-			// The last entry in the batch has the highest-or-equal term.
-			if last := entries[len(entries)-1]; last.Term > n.term {
-				n.mu.Lock()
-				if last.Term > n.term {
-					n.term = last.Term
+				ptrs := make([]*wal.Entry, len(entries))
+				for i := range entries {
+					ptrs[i] = &entries[i]
 				}
-				n.mu.Unlock()
-			}
-			// Advance only after a successful apply so a reconnect retries
-			// from the start of the failed batch rather than skipping it.
-			fromRev = entries[len(entries)-1].Revision + 1
-			return nil
-		})
+				if err := n.wal.AppendBatch(bgCtx, ptrs); err != nil {
+					return err
+				}
+				return nil
+			},
+			func(entries []wal.Entry) error {
+				if err := n.db.Apply(entries); err != nil {
+					return err
+				}
+				// Track the leader's term so attemptPromotion uses the correct
+				// floorTerm when calling TakeOver.  Without this, n.term stays at
+				// its Open() value and TakeOver backs off because it sees the
+				// current lock term as "already taken over at a higher term".
+				// The last entry in the batch has the highest-or-equal term.
+				if last := entries[len(entries)-1]; last.Term > n.term {
+					n.mu.Lock()
+					if last.Term > n.term {
+						n.term = last.Term
+					}
+					n.mu.Unlock()
+				}
+				// Advance only after a successful apply so a reconnect retries
+				// from the start of the failed batch rather than skipping it.
+				fromRev = entries[len(entries)-1].Revision + 1
+				return nil
+			},
+		)
 
 		if bgCtx.Err() != nil {
 			return

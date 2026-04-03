@@ -81,20 +81,22 @@ func (c *Client) getConn() (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
-// Follow streams WAL entries from the leader starting at fromRev, calling
-// applyFn for each batch of entries. fromRev advances automatically as entries
-// are applied. Batches contain all entries that arrived between consecutive
-// applyFn calls, amortising WAL fsyncs across multiple revisions.
+// Follow streams WAL entries from the leader starting at fromRev. For each
+// batch it first calls walFn to durably append the entries to the follower WAL,
+// then ACKs the highest revision in the batch to the leader, then calls applyFn
+// to update the follower's local state. fromRev advances automatically once the
+// WAL append succeeds. Batches contain all entries that arrived between
+// consecutive applyFn calls, amortising WAL fsyncs across multiple revisions.
 //
 // Follow reconnects on transient errors. It returns:
 //   - ctx.Err() on context cancellation.
 //   - ErrResyncRequired when the leader's buffer no longer covers fromRev.
 //   - ErrLeaderUnreachable after maxRetries consecutive connection failures.
 //   - ErrLeaderShutdown when the leader sent a graceful shutdown signal.
-func (c *Client) Follow(ctx context.Context, fromRev int64, applyFn func([]wal.Entry) error) error {
+func (c *Client) Follow(ctx context.Context, fromRev int64, walFn func([]wal.Entry) error, applyFn func([]wal.Entry) error) error {
 	consecutiveFailures := 0
 	for {
-		nextRev, err := c.followOnce(ctx, fromRev, applyFn)
+		nextRev, err := c.followOnce(ctx, fromRev, walFn, applyFn)
 
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -131,8 +133,10 @@ func (c *Client) Follow(ctx context.Context, fromRev int64, applyFn func([]wal.E
 }
 
 // followOnce makes one streaming attempt using the shared connection.
-// Returns the next fromRev (last applied revision + 1) on any error.
-func (c *Client) followOnce(ctx context.Context, fromRev int64, applyFn func([]wal.Entry) error) (int64, error) {
+// walFn must durably append the batch to the follower's local WAL.
+// applyFn updates follower local state after the ACK has been sent.
+// Returns the next fromRev (highest WAL-durable revision + 1) on any error.
+func (c *Client) followOnce(ctx context.Context, fromRev int64, walFn func([]wal.Entry) error, applyFn func([]wal.Entry) error) (int64, error) {
 	conn, err := c.getConn()
 	if err != nil {
 		return fromRev, err
@@ -202,15 +206,18 @@ func (c *Client) followOnce(ctx context.Context, fromRev int64, applyFn func([]w
 		}
 
 		batchStartRev := fromRev
-		if err := applyFn(batch); err != nil {
+		if err := walFn(batch); err != nil {
 			return batchStartRev, err
 		}
 		fromRev = batch[len(batch)-1].Revision + 1
 
-		// ACK the highest revision in the batch. The leader only needs the
-		// maximum ACK'd revision to advance its quorum counter, so one ACK
-		// per batch is enough regardless of how many entries it contained.
+		// ACK the highest revision in the WAL-durable batch. The leader only
+		// needs the maximum ACK'd revision to advance its quorum counter, so
+		// one ACK per batch is enough regardless of how many entries it contained.
 		if err := stream.SendAck(batch[len(batch)-1].Revision); err != nil {
+			return fromRev, err
+		}
+		if err := applyFn(batch); err != nil {
 			return fromRev, err
 		}
 	}
