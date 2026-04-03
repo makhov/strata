@@ -36,6 +36,8 @@ func makeEntry(rev int64) *wal.Entry {
 	}
 }
 
+func noopWAL([]wal.Entry) error { return nil }
+
 // TestStreamDelivery verifies that entries broadcast by the leader reach the follower.
 func TestStreamDelivery(t *testing.T) {
 	srv := peer.NewServer(1000)
@@ -47,7 +49,7 @@ func TestStreamDelivery(t *testing.T) {
 
 	received := make(chan wal.Entry, 16)
 	go func() {
-		cli.Follow(ctx, 1, func(entries []wal.Entry) error {
+		cli.Follow(ctx, 1, noopWAL, func(entries []wal.Entry) error {
 			for _, e := range entries {
 				received <- e
 			}
@@ -92,7 +94,7 @@ func TestCatchUp(t *testing.T) {
 
 	received := make(chan wal.Entry, 16)
 	go func() {
-		cli.Follow(ctx, 1, func(entries []wal.Entry) error {
+		cli.Follow(ctx, 1, noopWAL, func(entries []wal.Entry) error {
 			for _, e := range entries {
 				received <- e
 			}
@@ -143,7 +145,7 @@ func TestResyncRequired(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		// Ask for revision 1, which has been evicted from the 3-entry buffer.
-		errCh <- cli.Follow(ctx, 1, func([]wal.Entry) error { return nil })
+		errCh <- cli.Follow(ctx, 1, noopWAL, func([]wal.Entry) error { return nil })
 	}()
 
 	select {
@@ -213,7 +215,7 @@ func TestLeaderUnreachable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	err := cli.Follow(ctx, 1, func([]wal.Entry) error { return nil })
+	err := cli.Follow(ctx, 1, noopWAL, func([]wal.Entry) error { return nil })
 	if !peer.IsLeaderUnreachable(err) {
 		t.Errorf("expected IsLeaderUnreachable, got: %v", err)
 	}
@@ -233,7 +235,7 @@ func TestMultipleFollowers(t *testing.T) {
 		received[i] = make(chan wal.Entry, 16)
 		ch := received[i]
 		cli := peer.NewClient(addr, fmt.Sprintf("follower-%d", i), 3, nil)
-		go cli.Follow(ctx, 1, func(entries []wal.Entry) error {
+		go cli.Follow(ctx, 1, noopWAL, func(entries []wal.Entry) error {
 			for _, e := range entries {
 				ch <- e
 			}
@@ -280,7 +282,7 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		cli.Follow(ctx, 1, func(entries []wal.Entry) error {
+		cli.Follow(ctx, 1, noopWAL, func(entries []wal.Entry) error {
 			for _, e := range entries {
 				revisions = append(revisions, e.Revision)
 				if e.Revision >= 6 {
