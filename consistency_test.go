@@ -86,6 +86,11 @@ func openClusterNode(t testing.TB, store object.Store, id string) *strata.Node {
 	if err != nil {
 		t.Fatalf("Open %s: %v", id, err)
 	}
+	t.Cleanup(func() {
+		if err := n.Close(); err != nil {
+			t.Logf("Close %s during cleanup: %v", id, err)
+		}
+	})
 	return n
 }
 
