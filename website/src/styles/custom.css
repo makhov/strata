@@ -1,0 +1,21 @@
+:root {
+	--sl-color-accent-low: #1a2e1a;
+	--sl-color-accent: #2d6a2d;
+	--sl-color-accent-high: #4caf50;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #d4edda;
+	--sl-color-accent: #28a745;
+	--sl-color-accent-high: #155724;
+}
+
+/* Landing page hero */
+.hero-cta a[data-variant='primary'] {
+	background-color: var(--sl-color-accent);
+}
+
+/* Tighter code blocks */
+.expressive-code {
+	margin-block: 1rem;
+}
