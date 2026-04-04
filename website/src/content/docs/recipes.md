@@ -1,0 +1,349 @@
+---
+title: Recipes
+description: Common patterns for using Strata — distributed locks, service discovery, config management, and leader election.
+---
+
+## Distributed lock
+
+Use `Create` + `Delete` for a simple distributed lock. `Create` fails with `ErrKeyExists` if the key already exists, making it safe for concurrent acquisition.
+
+```go
+const lockKey = "/locks/my-resource"
+
+func acquireLock(ctx context.Context, node *strata.Node, ttl time.Duration) (release func(), err error) {
+    rev, err := node.Create(ctx, lockKey, []byte("locked"), 0)
+    if err != nil {
+        if errors.Is(err, strata.ErrKeyExists) {
+            return nil, fmt.Errorf("lock already held")
+        }
+        return nil, err
+    }
+
+    release = func() {
+        node.DeleteIfRevision(context.Background(), lockKey, rev)
+    }
+    return release, nil
+}
+
+// Usage
+release, err := acquireLock(ctx, node, 30*time.Second)
+if err != nil {
+    log.Fatal("could not acquire lock:", err)
+}
+defer release()
+
+// ... do work ...
+```
+
+### Lock with retry
+
+```go
+func acquireLockWithRetry(ctx context.Context, node *strata.Node, retryInterval time.Duration) (func(), error) {
+    for {
+        release, err := acquireLock(ctx, node, 0)
+        if err == nil {
+            return release, nil
+        }
+        if !errors.Is(err, strata.ErrKeyExists) {
+            return nil, err
+        }
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case <-time.After(retryInterval):
+        }
+    }
+}
+```
+
+### Lock with watch (reactive wait)
+
+Instead of polling, watch the lock key and retry only when it is released:
+
+```go
+func acquireLockWatching(ctx context.Context, node *strata.Node) (func(), error) {
+    for {
+        release, err := acquireLock(ctx, node, 0)
+        if err == nil {
+            return release, nil
+        }
+        if !errors.Is(err, strata.ErrKeyExists) {
+            return nil, err
+        }
+
+        // Watch for the lock to be deleted, then retry.
+        events, err := node.Watch(ctx, lockKey, 0)
+        if err != nil {
+            return nil, err
+        }
+        for e := range events {
+            if e.Type == strata.EventDelete {
+                break
+            }
+        }
+        if ctx.Err() != nil {
+            return nil, ctx.Err()
+        }
+    }
+}
+```
+
+---
+
+## Service discovery / registry
+
+Store service endpoints under a common prefix. Each service writes its own key; clients list the prefix to discover all instances.
+
+### Register
+
+```go
+const servicePrefix = "/services/my-api/"
+
+func register(ctx context.Context, node *strata.Node, instanceID, addr string) error {
+    key := servicePrefix + instanceID
+    _, err := node.Put(ctx, key, []byte(addr), 0)
+    return err
+}
+
+func deregister(ctx context.Context, node *strata.Node, instanceID string) error {
+    _, err := node.Delete(ctx, servicePrefix+instanceID)
+    return err
+}
+```
+
+### Discover
+
+```go
+func discover(node *strata.Node) ([]string, error) {
+    kvs, err := node.List(servicePrefix)
+    if err != nil {
+        return nil, err
+    }
+    addrs := make([]string, len(kvs))
+    for i, kv := range kvs {
+        addrs[i] = string(kv.Value)
+    }
+    return addrs, nil
+}
+```
+
+### Watch for changes
+
+```go
+func watchRegistry(ctx context.Context, node *strata.Node, onChange func([]string)) error {
+    events, err := node.Watch(ctx, servicePrefix, 0)
+    if err != nil {
+        return err
+    }
+    for range events {
+        addrs, err := discover(node)
+        if err != nil {
+            continue
+        }
+        onChange(addrs)
+    }
+    return nil
+}
+```
+
+---
+
+## Configuration management
+
+Strata is a natural fit for dynamic configuration — store config values as keys, watch for changes, and update in-process without a restart.
+
+### Write config
+
+```go
+type AppConfig struct {
+    Timeout  string `json:"timeout"`
+    MaxConns int    `json:"max_conns"`
+}
+
+func writeConfig(ctx context.Context, node *strata.Node, cfg AppConfig) error {
+    b, err := json.Marshal(cfg)
+    if err != nil {
+        return err
+    }
+    _, err = node.Put(ctx, "/config/app", b, 0)
+    return err
+}
+```
+
+### Read config
+
+```go
+func readConfig(node *strata.Node) (*AppConfig, error) {
+    kv, err := node.Get("/config/app")
+    if err != nil {
+        return nil, err
+    }
+    if kv == nil {
+        return nil, fmt.Errorf("config not found")
+    }
+    var cfg AppConfig
+    return &cfg, json.Unmarshal(kv.Value, &cfg)
+}
+```
+
+### Hot-reload on change
+
+```go
+func watchConfig(ctx context.Context, node *strata.Node, apply func(AppConfig)) {
+    events, _ := node.Watch(ctx, "/config/app", 0)
+    for e := range events {
+        if e.Type != strata.EventPut {
+            continue
+        }
+        var cfg AppConfig
+        if err := json.Unmarshal(e.KV.Value, &cfg); err == nil {
+            apply(cfg)
+        }
+    }
+}
+
+// In main:
+go watchConfig(ctx, node, func(cfg AppConfig) {
+    log.Printf("config updated: timeout=%s max_conns=%d", cfg.Timeout, cfg.MaxConns)
+    applyConfig(cfg)
+})
+```
+
+---
+
+## Compare-and-swap (CAS) counter
+
+Use `Update` to increment a counter atomically. `Update` is a compare-and-swap on the key's modification revision — it succeeds only if the revision you read is still current.
+
+```go
+func increment(ctx context.Context, node *strata.Node, key string) (int64, error) {
+    for {
+        kv, err := node.Get(key)
+        if err != nil {
+            return 0, err
+        }
+
+        var current int64
+        var prevRev int64
+        if kv != nil {
+            current, _ = strconv.ParseInt(string(kv.Value), 10, 64)
+            prevRev = kv.Revision
+        }
+
+        next := current + 1
+        _, _, ok, err := node.Update(ctx, key, []byte(strconv.FormatInt(next, 10)), prevRev, 0)
+        if err != nil {
+            return 0, err
+        }
+        if ok {
+            return next, nil
+        }
+        // Revision changed — someone else updated; retry.
+    }
+}
+```
+
+---
+
+## Leader election in your application
+
+Use Strata's `Create` + `Watch` to implement leader election for your own application on top of Strata.
+
+```go
+const electionKey = "/election/my-service"
+
+type Election struct {
+    node     *strata.Node
+    id       string
+    isLeader atomic.Bool
+}
+
+func (e *Election) Run(ctx context.Context) error {
+    for {
+        // Try to become leader.
+        rev, err := e.node.Create(ctx, electionKey, []byte(e.id), 0)
+        if err == nil {
+            // Won the election.
+            e.isLeader.Store(true)
+            log.Printf("%s: became leader at rev %d", e.id, rev)
+            e.runAsLeader(ctx)
+            e.isLeader.Store(false)
+            continue
+        }
+        if !errors.Is(err, strata.ErrKeyExists) {
+            return err
+        }
+
+        // Someone else is leader — watch until they step down.
+        log.Printf("%s: following", e.id)
+        events, err := e.node.Watch(ctx, electionKey, 0)
+        if err != nil {
+            return err
+        }
+        for event := range events {
+            if event.Type == strata.EventDelete {
+                break // Leader stepped down — try to acquire.
+            }
+        }
+        if ctx.Err() != nil {
+            return ctx.Err()
+        }
+    }
+}
+
+func (e *Election) runAsLeader(ctx context.Context) {
+    defer e.node.Delete(ctx, electionKey) // Resign on exit.
+    // Do leader work until ctx is cancelled or an error occurs.
+    <-ctx.Done()
+}
+```
+
+---
+
+## Consistent read after write
+
+After a follower serves a write that was forwarded to the leader, you may want to guarantee a subsequent read reflects that write. Use `WaitForRevision`:
+
+```go
+rev, err := node.Put(ctx, "/data/key", value, 0)
+if err != nil {
+    return err
+}
+
+// Ensure the local node has applied this revision before reading.
+if err := node.WaitForRevision(ctx, rev); err != nil {
+    return err
+}
+
+kv, err := node.Get("/data/key")
+```
+
+Or use `LinearizableGet` to sync to the leader's current revision in one call:
+
+```go
+kv, err := node.LinearizableGet(ctx, "/data/key")
+```
+
+---
+
+## History compaction
+
+Strata keeps the full revision history until you compact. Compact periodically to bound storage growth:
+
+```go
+func compactPeriodically(ctx context.Context, node *strata.Node, interval time.Duration) {
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            rev := node.CurrentRevision()
+            if err := node.Compact(ctx, rev); err != nil {
+                log.Printf("compact error: %v", err)
+            }
+        }
+    }
+}
+```
