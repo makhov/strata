@@ -167,6 +167,24 @@ type Config struct {
 	// MetricsAddr is the TCP address for the Prometheus /metrics, /healthz,
 	// and /readyz HTTP endpoints (e.g. "0.0.0.0:9090"). Empty means disabled.
 	MetricsAddr string
+
+	// ── Encryption ────────────────────────────────────────────────────────────
+
+	// Encryption, if non-nil, enables AES-256-GCM encryption for all data
+	// written to and read from the object store (WAL segments, SST files,
+	// checkpoint manifests). Local Pebble files on disk are not encrypted.
+	//
+	// Use [object.NewStaticKeyProvider] for a fixed 32-byte key loaded at
+	// startup. The KeyProvider interface is designed to be extended with KMS
+	// backends in a future release.
+	Encryption *EncryptionConfig
+}
+
+// EncryptionConfig holds encryption settings for a Node.
+type EncryptionConfig struct {
+	// KeyProvider supplies the AES-256 key used to encrypt/decrypt all objects
+	// in the object store. Must not be nil when Encryption is set.
+	KeyProvider object.KeyProvider
 }
 
 func (c *Config) setDefaults() {

@@ -324,6 +324,74 @@ etcdctl --user svc-account:pass get /secrets/key         # PermissionDenied
 
 ---
 
+## Encryption at rest
+
+Strata can encrypt all data written to the object store (WAL segments, SST files, checkpoints, and manifests) using AES-256-GCM. Each object is encrypted with a unique random nonce; the authentication tag provides integrity verification on every read. Local Pebble files on disk are not encrypted.
+
+### Enabling encryption
+
+Generate a 32-byte key and store it securely:
+
+```bash
+# Generate a random key and save it (base64-encoded)
+openssl rand -base64 32 > /etc/strata/encryption.key
+chmod 600 /etc/strata/encryption.key
+```
+
+Pass the key file to the node:
+
+```bash
+strata run \
+  --data-dir /var/lib/strata \
+  --s3-bucket my-bucket      \
+  --encryption-key-file /etc/strata/encryption.key
+```
+
+Alternatively, supply the key via an environment variable:
+
+```bash
+export STRATA_ENCRYPTION_KEY=$(openssl rand -base64 32)
+strata run \
+  --data-dir /var/lib/strata \
+  --s3-bucket my-bucket      \
+  --encryption-key-env STRATA_ENCRYPTION_KEY
+```
+
+The key file may contain the key as:
+- **Raw bytes** — 32 bytes
+- **Hex** — 64 lowercase hex characters
+- **Base64** — 44 standard base64 characters (`=`-padded)
+
+### Embedded library
+
+```go
+key := make([]byte, 32)
+if _, err := rand.Read(key); err != nil { ... }
+kp, err := object.NewStaticKeyProvider(key)
+if err != nil { ... }
+
+node, err := strata.Open(strata.Config{
+    DataDir:     "/var/lib/strata",
+    ObjectStore: myS3Store,
+    Encryption: &strata.EncryptionConfig{
+        KeyProvider: kp,
+    },
+})
+```
+
+### Multi-node clusters
+
+All nodes in a cluster **must use the same key**. The key is not stored or transmitted by Strata — each node loads it independently from its key file or environment.
+
+### Limitations (V1)
+
+- **Local disk not encrypted.** Pebble files in `--data-dir` are stored in plaintext. Use OS-level disk encryption (dm-crypt, LUKS, FileVault) for local-at-rest protection.
+- **No key rotation.** Rotating a key requires stopping all nodes and re-encrypting every object in the bucket. A `strata rekey` utility is planned.
+- **Branch nodes.** The branch node and its source must use the same encryption key in V1.
+- **Lockout state.** Rate-limiting lockout state is in-memory and is not affected by encryption.
+
+---
+
 ## Observability
 
 ```bash

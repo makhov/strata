@@ -25,6 +25,13 @@
 | `PeerClientTLS` | `credentials.TransportCredentials` | `nil` | mTLS credentials for the peer gRPC client (follower side). |
 | `MetricsAddr` | `string` | `""` | HTTP address for `/metrics`, `/healthz`, `/readyz`. Empty = disabled. |
 | `ReadConsistency` | `ReadConsistency` | `"linearizable"` | Consistency guarantee for reads served by the etcd adapter. `"linearizable"` (default): each read syncs to the leader's current revision before returning, ensuring no stale reads. `"serializable"`: reads are served from local Pebble state without a round-trip to the leader; lower latency but may return slightly stale data on followers. |
+| `Encryption` | `*EncryptionConfig` | `nil` | When non-nil, enables AES-256-GCM encryption for all data written to and read from the object store (WAL segments, SST files, checkpoints, manifests). Local Pebble files on disk are not encrypted. See [Encryption at rest](operations.md#encryption-at-rest). |
+
+### `EncryptionConfig`
+
+| Field | Type | Description |
+|---|---|---|
+| `KeyProvider` | `object.KeyProvider` | Supplies the 32-byte AES-256 key. Use `object.NewStaticKeyProvider(key)` for a fixed key loaded at startup. The interface is designed for future KMS backends. |
 
 ### Using a custom S3-compatible store
 
@@ -92,6 +99,8 @@ strata run [flags]
 | `--auth-enabled` | `false` | Enable etcd-compatible authentication and RBAC |
 | `--token-ttl` | `300` | Bearer token lifetime in seconds |
 | `--metrics-addr` | — | HTTP address for metrics and health endpoints |
+| `--encryption-key-file` | — | Path to file containing a 32-byte AES-256 key (raw, hex-encoded, or base64-encoded). Enables encryption at rest for all S3 objects. |
+| `--encryption-key-env` | — | Environment variable holding a base64-encoded 32-byte AES-256 key. Alternative to `--encryption-key-file`. |
 | `--branch-source-bucket` | — | S3 bucket of the source database (branch nodes only) |
 | `--branch-source-prefix` | — | S3 prefix of the source database (branch nodes only) |
 | `--branch-source-endpoint` | — | S3 endpoint of the source database (branch nodes only) |
