@@ -2,9 +2,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -220,6 +223,9 @@ func runCmd() *cobra.Command {
 		branchSourcePrefix   string
 		branchSourceEndpoint string
 		branchCheckpoint     string
+		// encryption
+		encryptionKeyFile string
+		encryptionKeyEnv  string
 	)
 
 	cmd := &cobra.Command{
@@ -325,6 +331,15 @@ func runCmd() *cobra.Command {
 				cfg.AncestorStore = sourceStore
 				logrus.Infof("branch node: source bucket %q prefix %q checkpoint %q",
 					branchSourceBucket, branchSourcePrefix, branchCheckpoint)
+			}
+
+			if encryptionKeyFile != "" || encryptionKeyEnv != "" {
+				kp, err := loadEncryptionKey(encryptionKeyFile, encryptionKeyEnv)
+				if err != nil {
+					return fmt.Errorf("encryption key: %w", err)
+				}
+				cfg.Encryption = &strata.EncryptionConfig{KeyProvider: kp}
+				logrus.Info("encryption at rest enabled (AES-256-GCM)")
 			}
 
 			node, err := strata.Open(cfg)
@@ -437,6 +452,9 @@ func runCmd() *cobra.Command {
 	cmd.Flags().StringVar(&branchSourcePrefix, "branch-source-prefix", "", "S3 key prefix of the source node")
 	cmd.Flags().StringVar(&branchSourceEndpoint, "branch-source-endpoint", "", "custom S3 endpoint for the source store")
 	cmd.Flags().StringVar(&branchCheckpoint, "branch-checkpoint", "", "checkpoint index key returned by 'strata branch fork' (required with --branch-source-bucket)")
+	// encryption
+	cmd.Flags().StringVar(&encryptionKeyFile, "encryption-key-file", "", "path to file containing a 32-byte AES-256 key (raw, hex, or base64)")
+	cmd.Flags().StringVar(&encryptionKeyEnv, "encryption-key-env", "", "environment variable holding a base64-encoded 32-byte AES-256 key")
 
 	return cmd
 }
@@ -604,4 +622,54 @@ func newS3Store(ctx context.Context, bucket, prefix, endpoint string) (*object.S
 	}
 	client := s3.NewFromConfig(awsCfg, clientOpts...)
 	return object.NewS3Store(client, bucket, prefix), nil
+}
+
+// loadEncryptionKey reads a 32-byte AES-256 key from a file or an environment
+// variable. The key may be raw bytes (32), lowercase hex (64 chars), or
+// standard base64 (44 chars). keyFile takes precedence over keyEnv.
+func loadEncryptionKey(keyFile, keyEnv string) (*object.StaticKeyProvider, error) {
+	var raw []byte
+
+	if keyFile != "" {
+		data, err := os.ReadFile(keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("read key file: %w", err)
+		}
+		raw = bytes.TrimSpace(data)
+	} else {
+		val := os.Getenv(keyEnv)
+		if val == "" {
+			return nil, fmt.Errorf("environment variable %q is empty or not set", keyEnv)
+		}
+		raw = []byte(val)
+	}
+
+	decoded, err := decodeKeyMaterial(raw)
+	if err != nil {
+		return nil, err
+	}
+	return object.NewStaticKeyProvider(decoded)
+}
+
+// decodeKeyMaterial decodes a key from raw bytes, lowercase hex (64 chars), or
+// standard base64 (44 chars). Returns an error for any other length or format.
+func decodeKeyMaterial(raw []byte) ([]byte, error) {
+	switch len(raw) {
+	case 32:
+		return raw, nil
+	case 64:
+		dst := make([]byte, 32)
+		if _, err := hex.Decode(dst, raw); err != nil {
+			return nil, fmt.Errorf("hex key: %w", err)
+		}
+		return dst, nil
+	case 44:
+		dst, err := base64.StdEncoding.DecodeString(string(raw))
+		if err != nil {
+			return nil, fmt.Errorf("base64 key: %w", err)
+		}
+		return dst, nil
+	default:
+		return nil, fmt.Errorf("key must be 32 raw bytes, 64 hex chars, or 44 base64 chars; got %d bytes", len(raw))
+	}
 }

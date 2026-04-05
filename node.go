@@ -160,6 +160,16 @@ func (n *Node) storeRole(r nodeRole) { n.role.Store(int32(r)) }
 func Open(cfg Config) (*Node, error) {
 	cfg.setDefaults()
 
+	// Wrap object stores with transparent AES-256-GCM encryption when configured.
+	if cfg.Encryption != nil {
+		if cfg.ObjectStore != nil {
+			cfg.ObjectStore = object.NewEncryptedStore(cfg.ObjectStore, cfg.Encryption.KeyProvider)
+		}
+		if cfg.AncestorStore != nil {
+			cfg.AncestorStore = object.NewEncryptedStore(cfg.AncestorStore, cfg.Encryption.KeyProvider)
+		}
+	}
+
 	pebbleDir := filepath.Join(cfg.DataDir, "db")
 	walDir := filepath.Join(cfg.DataDir, "wal")
 

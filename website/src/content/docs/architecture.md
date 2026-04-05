@@ -216,6 +216,30 @@ Entries are stored at `branches/<id>` in the source store as JSON:
 
 ---
 
+## Encryption at rest
+
+When `Config.Encryption` is set, Strata wraps the `object.Store` with an `EncryptedStore` at startup. Every object written to or read from the store (WAL segments, SST files, checkpoint indices, manifests, leader-lock) is transparently encrypted and decrypted — no changes are required in the WAL, SST uploader, or checkpoint code.
+
+**Algorithm:** AES-256-GCM (AEAD — provides both confidentiality and integrity).
+
+**Per-object wire format (chunked streaming, 64 KiB chunks):**
+
+```
+[1: version=0x01][1: keyID][12: fileNonce]
+repeated: [4: chunkPlainLen uint32 BE][chunkPlainLen+16: ciphertext+GCM tag]
+end:       [4: 0x00000000]
+```
+
+Each object gets a fresh 12-byte random `fileNonce`. Per-chunk nonces are derived by XOR-ing the last 8 bytes of the file nonce with the chunk index, ensuring every (file, chunk) pair has a unique nonce. Overhead is 30 bytes per object plus 16 bytes (GCM tag) per 64 KiB chunk.
+
+**Content-addressed SST deduplication is preserved.** SST keys are `sst/{hash16-of-plaintext}/{name}` — the hash is computed from the *plaintext* before upload. The encrypted ciphertext stored at that key differs per upload (different random nonce), but the key still identifies the content, so duplicate-detection ("does this key already exist?") works correctly.
+
+**Optional interface propagation.** `EncryptedStore` delegates `ConditionalStore` (leader election CAS) and `VersionedStore` (point-in-time restore) to the inner store, encrypting/decrypting only the object body while leaving ETag and version-ID semantics unchanged.
+
+**Scope.** S3 objects only. Local Pebble files are not encrypted in V1. A future `EncryptedFS` (`vfs.FS` wrapper for Pebble) is planned.
+
+---
+
 ## Concurrency model
 
 - **Revision assignment** is serialised under `node.mu`. This keeps the revision counter monotonic.
