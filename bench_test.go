@@ -535,3 +535,61 @@ func BenchmarkWatchScaled(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkDatasetSize measures Put and Get latency as the dataset grows.
+// Population uses concurrent writers to avoid taking minutes at serial speed.
+//
+// Run with: go test -bench=BenchmarkDatasetSize -benchtime=3s
+func BenchmarkDatasetSize(b *testing.B) {
+	for _, size := range []int{10_000, 100_000} {
+		size := size
+		populate := func(b *testing.B, node *strata.Node) {
+			b.Helper()
+			ctx := context.Background()
+			const workers = 192
+			var idx atomic.Int64
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for w := 0; w < workers; w++ {
+				go func() {
+					defer wg.Done()
+					for {
+						i := idx.Add(1) - 1
+						if int(i) >= size {
+							return
+						}
+						node.Put(ctx, fmt.Sprintf("/ds/%08d", i), []byte("value12345678901234567890"), 0) //nolint
+					}
+				}()
+			}
+			wg.Wait()
+		}
+
+		b.Run(fmt.Sprintf("keys=%d/put", size), func(b *testing.B) {
+			node := openBenchNode(b)
+			ctx := context.Background()
+			b.Log("populating dataset...")
+			populate(b, node)
+			b.ReportMetric(float64(size), "existing_keys")
+			b.ResetTimer()
+			var counter atomic.Int64
+			for i := 0; i < b.N; i++ {
+				k := counter.Add(1)
+				if _, err := node.Put(ctx, fmt.Sprintf("/ds/new/%d", k), []byte("v"), 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("keys=%d/get", size), func(b *testing.B) {
+			node := openBenchNode(b)
+			b.Log("populating dataset...")
+			populate(b, node)
+			b.ReportMetric(float64(size), "existing_keys")
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				node.Get(fmt.Sprintf("/ds/%08d", i%size)) //nolint
+			}
+		})
+	}
+}

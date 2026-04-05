@@ -520,6 +520,17 @@ Write latency = leader WAL fsync + quorum ACK round-trip (follower WAL fsync + n
 
 With group commit, the per-write overhead of the quorum ACK round-trip disappears almost entirely under load — high concurrency improves throughput by batching many writes into one ACK round.
 
+### Dataset size
+
+Write latency is dominated by WAL fsync and is independent of dataset size. Read latency grows as the working set exceeds the Pebble block cache (Pebble reads SST files from disk for cold data).
+
+| Dataset | `Put` latency | `Get` latency | Notes |
+|---|---|---|---|
+| 10 K keys | ~5.5 ms | ~0.9 µs | all data in memtable / block cache |
+| 100 K keys | ~4.6 ms | ~8.9 µs | some SST reads from disk |
+
+Pebble itself handles datasets in the tens of GB on commodity NVMe. Strata adds no structural limit beyond Pebble's own.
+
 ### Impact of real-world latency
 
 Write latency scales with inter-node RTT and S3 latency (single-node only):
