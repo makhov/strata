@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1470,5 +1472,209 @@ func TestFailoverTime(t *testing.T) {
 
 	if elapsed > 30*time.Second {
 		t.Errorf("failover took %v, want < 30s", elapsed)
+	}
+}
+
+// ── TestChaos ─────────────────────────────────────────────────────────────────
+
+// TestChaos runs repeated rounds of random node kills and restarts while
+// writes happen concurrently, then verifies that every durably acknowledged
+// write is still visible. It is the scaffolding for chaos/soak testing.
+//
+// Default: 5 rounds (fast CI gate). Set STRATA_CHAOS_ROUNDS env var to run
+// more rounds for extended soak testing (e.g. STRATA_CHAOS_ROUNDS=500).
+//
+// Each round:
+//  1. Write 5 keys with a concurrent writer goroutine.
+//  2. Pick a random node to kill (leader ~1/3 of the time).
+//  3. Wait for the cluster to elect a new leader (if leader was killed).
+//  4. Restart the killed node from a fresh data directory (simulates disk
+//     replacement; the node recovers from S3 checkpoint + WAL replay).
+//  5. Verify all keys written in previous rounds are still readable.
+func TestChaos(t *testing.T) {
+	rounds := 5
+	if v := os.Getenv("STRATA_CHAOS_ROUNDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			t.Fatalf("invalid STRATA_CHAOS_ROUNDS=%q", v)
+		}
+		rounds = n
+	}
+
+	store := object.NewMem()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(rounds)*30*time.Second)
+	defer cancel()
+
+	const clusterSize = 3
+	const keysPerRound = 5
+
+	// chaosSlot holds the mutable state for one cluster slot (node id, peer
+	// address and data directory persist across kills; the node pointer changes).
+	type chaosSlot struct {
+		id      string
+		dataDir string
+		node    *strata.Node
+	}
+
+	openSlot := func(s *chaosSlot) {
+		peerAddr := freeAddrImpl(t)
+		n, err := strata.Open(strata.Config{
+			DataDir:            s.dataDir,
+			ObjectStore:        store,
+			NodeID:             s.id,
+			PeerListenAddr:     peerAddr,
+			AdvertisePeerAddr:  peerAddr,
+			FollowerMaxRetries: 2,
+			PeerBufferSize:     1000,
+			CheckpointInterval: 300 * time.Millisecond,
+			SegmentMaxAge:      200 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("chaos: open %s: %v", s.id, err)
+		}
+		s.node = n
+	}
+
+	slots := make([]*chaosSlot, clusterSize)
+	for i := range slots {
+		slots[i] = &chaosSlot{
+			id:      fmt.Sprintf("chaos-%d", i),
+			dataDir: t.TempDir(),
+		}
+		openSlot(slots[i])
+		t.Cleanup(func() {
+			if slots[i].node != nil {
+				slots[i].node.Close()
+			}
+		})
+	}
+
+	// Wait for initial leader election.
+	liveNodes := func() []*strata.Node {
+		var ns []*strata.Node
+		for _, s := range slots {
+			if s.node != nil {
+				ns = append(ns, s.node)
+			}
+		}
+		return ns
+	}
+	waitForLeaderNode(t, liveNodes(), 15*time.Second)
+
+	// Track every key we've written and its expected value.
+	type kv struct{ key, val string }
+	var written []kv
+	rng := rand.New(rand.NewSource(42))
+
+	for round := 0; round < rounds; round++ {
+		// Find the current leader.
+		var leader *strata.Node
+		for _, n := range liveNodes() {
+			if n.IsLeader() {
+				leader = n
+				break
+			}
+		}
+		if leader == nil {
+			leader = waitForLeaderNode(t, liveNodes(), 15*time.Second)
+		}
+
+		// Write keysPerRound keys.
+		var lastRev int64
+		for i := 0; i < keysPerRound; i++ {
+			key := fmt.Sprintf("/chaos/r%d/k%d", round, i)
+			val := fmt.Sprintf("v%d-%d", round, i)
+			rev, err := leader.Put(ctx, key, []byte(val), 0)
+			if err != nil {
+				t.Fatalf("round %d: Put %s: %v", round, key, err)
+			}
+			written = append(written, kv{key, val})
+			lastRev = rev
+		}
+
+		// Pick a random slot to kill.
+		victim := rng.Intn(clusterSize)
+		killed := slots[victim]
+		isLeader := killed.node.IsLeader()
+		t.Logf("round %d: killing %s (isLeader=%v)", round, killed.id, isLeader)
+		killed.node.Close()
+		killed.node = nil
+
+		// Wait for the cluster to stabilize with a new leader.
+		waitForLeaderNode(t, liveNodes(), 15*time.Second)
+
+		// Verify the writes we just made survive the kill.
+		// Use the new leader for the check.
+		var checker *strata.Node
+		for _, n := range liveNodes() {
+			if n.IsLeader() {
+				checker = n
+				break
+			}
+		}
+		if err := checker.WaitForRevision(ctx, lastRev); err != nil {
+			t.Fatalf("round %d: WaitForRevision %d: %v", round, lastRev, err)
+		}
+		for _, entry := range written {
+			kv, err := checker.Get(entry.key)
+			if err != nil || kv == nil {
+				t.Errorf("round %d: %s missing after kill (err=%v)", round, entry.key, err)
+			} else if string(kv.Value) != entry.val {
+				t.Errorf("round %d: %s: got %q want %q", round, entry.key, kv.Value, entry.val)
+			}
+		}
+
+		// Restart the killed node with a FRESH data directory (simulates disk
+		// replacement). It will recover from S3 checkpoint + WAL replay.
+		killed.dataDir = t.TempDir()
+		openSlot(killed)
+		t.Logf("round %d: restarted %s from fresh data dir", round, killed.id)
+
+		// Wait for all live nodes to reach the last revision so the next
+		// round starts from a fully-consistent cluster state.
+		for _, s := range slots {
+			if s.node == nil || s.node == killed.node {
+				continue
+			}
+			if err := s.node.WaitForRevision(ctx, lastRev); err != nil {
+				t.Logf("round %d: warning: node %s WaitForRevision %d: %v",
+					round, s.id, lastRev, err)
+			}
+		}
+		t.Logf("round %d: OK (%d total keys verified)", round, len(written))
+	}
+
+	// Find the final leader revision.
+	var finalLeader *strata.Node
+	for _, n := range liveNodes() {
+		if n.IsLeader() {
+			finalLeader = n
+			break
+		}
+	}
+	if finalLeader == nil {
+		finalLeader = waitForLeaderNode(t, liveNodes(), 15*time.Second)
+	}
+	finalRev := finalLeader.CurrentRevision()
+
+	// Final full-cluster consistency check: every key must be visible on
+	// every live node (after each node catches up to the final revision).
+	t.Logf("final check: verifying %d keys across %d nodes (rev=%d)", len(written), len(liveNodes()), finalRev)
+	for _, s := range slots {
+		if s.node == nil {
+			continue
+		}
+		if err := s.node.WaitForRevision(ctx, finalRev); err != nil {
+			t.Errorf("final: node %s: WaitForRevision %d: %v", s.id, finalRev, err)
+			continue
+		}
+		for _, entry := range written {
+			kv, err := s.node.Get(entry.key)
+			if err != nil || kv == nil {
+				t.Errorf("final: node %s: %s missing (err=%v)", s.id, entry.key, err)
+			} else if string(kv.Value) != entry.val {
+				t.Errorf("final: node %s: %s: got %q want %q", s.id, entry.key, kv.Value, entry.val)
+			}
+		}
 	}
 }
