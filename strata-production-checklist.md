@@ -70,10 +70,10 @@ It is divided into stages and clear pass/fail requirements.
 - [x] Checkpoint corruption recovery tested — `TestCheckpointCorruptionManifest`, `TestCheckpointCorruptionArchive`
 
 ### Scalability Envelope (DOCUMENTED)
-- [ ] Max tested nodes: ______
-- [ ] Max tested writes/sec: ______
-- [ ] Max watchers: ______
-- [ ] Max dataset size: ______
+- [x] Max tested nodes: 3 (automated); larger clusters not tested
+- [x] Max tested writes/sec: ~15,800/s (192 concurrent writers, single-node loopback); ~520/s (3-node cluster, 192 concurrent writers, loopback) — `BenchmarkPutParallelScaled`
+- [x] Max watchers: 500 tested (single-node loopback); write latency grows from 3.9ms (1 watcher) to 5.4ms (500 watchers) — `BenchmarkWatchScaled`
+- [x] Max dataset size: 100K keys tested; Put latency flat (~4.6ms, WAL-dominated); Get latency 0.9µs (10K, in-memory) → 8.9µs (100K, SST reads) — `BenchmarkDatasetSize`
 
 ### Tail Latency
 - [x] p99 write latency acceptable — single-node p99=8ms; 3-node cluster p99=21ms (loopback); `BenchmarkPutLatencyPercentiles`, `BenchmarkPutClusterLatencyPercentiles`
@@ -84,7 +84,7 @@ It is divided into stages and clear pass/fail requirements.
 - [x] Leader / follower state metrics — `strata_role` gauge
 - [x] Follower lag metrics — `strata_follower_lag_revisions{follower_id=...}` gauge; updated on every ACK, deleted on disconnect
 - [x] WAL throughput metrics — `strata_wal_uploads_total`, `strata_wal_upload_duration_seconds`
-- [ ] S3 error + latency metrics — WAL upload errors tracked; no general S3 latency metric
+- [x] S3 error + latency metrics — `strata_object_store_ops_total{op,result}` and `strata_object_store_duration_seconds{op}` via instrumented wrapper in `pkg/object/instrumented.go`; covers all operations (get/put/delete/list + conditional variants)
 - [x] Alerting defined — 9 alert rules in `docs/operations.md`: MissingLeader, SplitBrain, HighWriteErrorRate, HighWriteLatency, WALUploadErrors, S3ErrorRate, S3HighLatency, FollowerLagging, FollowerResync
 
 ### Upgrade & Compatibility

@@ -506,6 +506,7 @@ Write latency is dominated by a single WAL fsync (~4 ms on NVMe). Concurrent wri
 | `Get` / `LinearizableGet` (leader) | ~2,260,000 reads/s | 0.44 µs | — | — |
 | `List` (100 keys) | ~28,000 ops/s | 35.7 µs | — | — |
 | Watch event delivery | — | 4.8 ms | 7.8 ms | 11.1 ms |
+| Watch fan-out (500 watchers) | ~186 writes/s | ~5.4 ms | — | — |
 
 ### 3-node cluster (localhost loopback)
 
@@ -518,6 +519,17 @@ Write latency = leader WAL fsync + quorum ACK round-trip (follower WAL fsync + n
 | `LinearizableGet` (follower) | ~20,800 reads/s | 48 µs | — | — |
 
 With group commit, the per-write overhead of the quorum ACK round-trip disappears almost entirely under load — high concurrency improves throughput by batching many writes into one ACK round.
+
+### Dataset size
+
+Write latency is dominated by WAL fsync and is independent of dataset size. Read latency grows as the working set exceeds the Pebble block cache (Pebble reads SST files from disk for cold data).
+
+| Dataset | `Put` latency | `Get` latency | Notes |
+|---|---|---|---|
+| 10 K keys | ~5.5 ms | ~0.9 µs | all data in memtable / block cache |
+| 100 K keys | ~4.6 ms | ~8.9 µs | some SST reads from disk |
+
+Pebble itself handles datasets in the tens of GB on commodity NVMe. Strata adds no structural limit beyond Pebble's own.
 
 ### Impact of real-world latency
 
