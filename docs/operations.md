@@ -506,6 +506,7 @@ Write latency is dominated by a single WAL fsync (~4 ms on NVMe). Concurrent wri
 | `Get` / `LinearizableGet` (leader) | ~2,260,000 reads/s | 0.44 µs | — | — |
 | `List` (100 keys) | ~28,000 ops/s | 35.7 µs | — | — |
 | Watch event delivery | — | 4.8 ms | 7.8 ms | 11.1 ms |
+| Watch fan-out (500 watchers) | ~186 writes/s | ~5.4 ms | — | — |
 
 ### 3-node cluster (localhost loopback)
 

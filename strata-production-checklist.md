@@ -70,10 +70,10 @@ It is divided into stages and clear pass/fail requirements.
 - [x] Checkpoint corruption recovery tested — `TestCheckpointCorruptionManifest`, `TestCheckpointCorruptionArchive`
 
 ### Scalability Envelope (DOCUMENTED)
-- [ ] Max tested nodes: ______
-- [ ] Max tested writes/sec: ______
-- [ ] Max watchers: ______
-- [ ] Max dataset size: ______
+- [x] Max tested nodes: 3 (automated); larger clusters not tested
+- [x] Max tested writes/sec: ~15,800/s (192 concurrent writers, single-node loopback); ~520/s (3-node cluster, 192 concurrent writers, loopback) — `BenchmarkPutParallelScaled`
+- [x] Max watchers: 500 tested (single-node loopback); write latency grows from 3.9ms (1 watcher) to 5.4ms (500 watchers) — `BenchmarkWatchScaled`
+- [ ] Max dataset size: not measured
 
 ### Tail Latency
 - [x] p99 write latency acceptable — single-node p99=8ms; 3-node cluster p99=21ms (loopback); `BenchmarkPutLatencyPercentiles`, `BenchmarkPutClusterLatencyPercentiles`

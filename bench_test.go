@@ -496,3 +496,42 @@ func BenchmarkWatchLatencyPercentiles(b *testing.B) {
 	b.StopTimer()
 	latencyPercentiles(b, latencies)
 }
+
+// BenchmarkWatchScaled measures write throughput and latency as the number of
+// concurrent watchers grows. Each watcher subscribes to the same prefix so
+// fan-out is proportional to the watcher count. Reports ns/op (write-to-last-
+// watcher-notified latency) and a custom "watchers" metric.
+//
+// Run with: go test -bench=BenchmarkWatchScaled -benchtime=5s
+func BenchmarkWatchScaled(b *testing.B) {
+	for _, n := range []int{1, 10, 50, 100, 500} {
+		n := n
+		b.Run(fmt.Sprintf("watchers=%d", n), func(b *testing.B) {
+			node := openBenchNode(b)
+			ctx, cancel := context.WithCancel(context.Background())
+			b.Cleanup(cancel)
+
+			// Open n watchers on the same prefix so every write fans out to all.
+			channels := make([]<-chan strata.Event, n)
+			for i := 0; i < n; i++ {
+				ch, err := node.Watch(ctx, "/bench/watchscaled/", 0)
+				if err != nil {
+					b.Fatalf("Watch %d: %v", i, err)
+				}
+				channels[i] = ch
+			}
+
+			b.ReportMetric(float64(n), "watchers")
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := node.Put(ctx, fmt.Sprintf("/bench/watchscaled/%d", i), []byte("v"), 0); err != nil {
+					b.Fatal(err)
+				}
+				// Drain all watchers so none fall behind.
+				for _, ch := range channels {
+					<-ch
+				}
+			}
+		})
+	}
+}
