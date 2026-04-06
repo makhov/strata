@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
@@ -164,6 +165,10 @@ func Open(cfg Config) (*Node, error) {
 
 	log := cfg.Logger
 	cp := checkpoint.New(log)
+
+	// Register all Strata metrics on the configured registerer.
+	// When nil, metrics.Register falls back to prometheus.DefaultRegisterer.
+	metrics.Register(cfg.MetricsRegisterer)
 
 	// Wrap the object store with Prometheus instrumentation so every S3
 	// operation is counted and timed without scattering metrics calls
@@ -518,7 +523,11 @@ func Open(cfg Config) (*Node, error) {
 	// ── Observability ─────────────────────────────────────────────────────────
 	n.updateMetrics()
 	if cfg.MetricsAddr != "" {
-		go n.serveMetrics(bgCtx, cfg.MetricsAddr)
+		var gatherer prometheus.Gatherer
+		if g, ok := cfg.MetricsRegisterer.(prometheus.Gatherer); ok {
+			gatherer = g
+		}
+		go n.serveMetrics(bgCtx, cfg.MetricsAddr, gatherer)
 	}
 
 	return n, nil
@@ -526,9 +535,17 @@ func Open(cfg Config) (*Node, error) {
 
 // serveMetrics starts an HTTP server exposing /metrics, /healthz, /readyz,
 // and /healthz/leader (used by Envoy active health checks to identify the leader).
-func (n *Node) serveMetrics(ctx context.Context, addr string) {
+// When gatherer is non-nil it is used to serve /metrics; otherwise the default
+// Prometheus gatherer is used.
+func (n *Node) serveMetrics(ctx context.Context, addr string, gatherer prometheus.Gatherer) {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
+	var metricsHandler http.Handler
+	if gatherer != nil {
+		metricsHandler = promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})
+	} else {
+		metricsHandler = promhttp.Handler()
+	}
+	mux.Handle("/metrics", metricsHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})

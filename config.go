@@ -4,6 +4,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/credentials"
 
 	"github.com/t4db/t4/pkg/object"
@@ -187,6 +188,14 @@ type Config struct {
 	// MetricsAddr is the TCP address for the Prometheus /metrics, /healthz,
 	// and /readyz HTTP endpoints (e.g. "0.0.0.0:9090"). Empty means disabled.
 	MetricsAddr string
+
+	// MetricsRegisterer is the Prometheus registerer used to register all
+	// Strata metrics. When nil, prometheus.DefaultRegisterer is used.
+	// Pass a *prometheus.Registry to isolate Strata metrics from the global
+	// registry (useful when embedding Strata in applications that manage their
+	// own Prometheus registries). If MetricsAddr is set and the value also
+	// implements prometheus.Gatherer, it is used to serve /metrics as well.
+	MetricsRegisterer prometheus.Registerer
 }
 
 func (c *Config) setDefaults() {
