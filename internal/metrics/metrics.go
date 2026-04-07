@@ -73,6 +73,7 @@ var (
 )
 
 var once sync.Once
+var gatherer prometheus.Gatherer = prometheus.DefaultGatherer
 
 // Register registers all Strata metrics on reg. Only the first call takes
 // effect — subsequent calls are no-ops (safe for multiple Open() calls).
@@ -82,6 +83,10 @@ func Register(reg prometheus.Registerer) {
 		reg = prometheus.DefaultRegisterer
 	}
 	once.Do(func() {
+		if g, ok := reg.(prometheus.Gatherer); ok {
+			gatherer = g
+		}
+
 		WritesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "strata_writes_total",
 			Help: "Total write operations (put/create/update/delete/compact).",
@@ -203,6 +208,13 @@ func Register(reg prometheus.Registerer) {
 			ObjectStoreDuration,
 		)
 	})
+}
+
+// Gatherer returns the Prometheus gatherer associated with the singleton
+// metrics registration. When the configured registerer does not implement
+// prometheus.Gatherer, this falls back to prometheus.DefaultGatherer.
+func Gatherer() prometheus.Gatherer {
+	return gatherer
 }
 
 // SetRole updates the role gauges so exactly one has value 1.

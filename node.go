@@ -16,7 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
@@ -523,11 +522,7 @@ func Open(cfg Config) (*Node, error) {
 	// ── Observability ─────────────────────────────────────────────────────────
 	n.updateMetrics()
 	if cfg.MetricsAddr != "" {
-		var gatherer prometheus.Gatherer
-		if g, ok := cfg.MetricsRegisterer.(prometheus.Gatherer); ok {
-			gatherer = g
-		}
-		go n.serveMetrics(bgCtx, cfg.MetricsAddr, gatherer)
+		go n.serveMetrics(bgCtx, cfg.MetricsAddr)
 	}
 
 	return n, nil
@@ -535,17 +530,9 @@ func Open(cfg Config) (*Node, error) {
 
 // serveMetrics starts an HTTP server exposing /metrics, /healthz, /readyz,
 // and /healthz/leader (used by Envoy active health checks to identify the leader).
-// When gatherer is non-nil it is used to serve /metrics; otherwise the default
-// Prometheus gatherer is used.
-func (n *Node) serveMetrics(ctx context.Context, addr string, gatherer prometheus.Gatherer) {
+func (n *Node) serveMetrics(ctx context.Context, addr string) {
 	mux := http.NewServeMux()
-	var metricsHandler http.Handler
-	if gatherer != nil {
-		metricsHandler = promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})
-	} else {
-		metricsHandler = promhttp.Handler()
-	}
-	mux.Handle("/metrics", metricsHandler)
+	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Gatherer(), promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})

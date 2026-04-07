@@ -193,8 +193,9 @@ type Config struct {
 	// Strata metrics. When nil, prometheus.DefaultRegisterer is used.
 	// Pass a *prometheus.Registry to isolate Strata metrics from the global
 	// registry (useful when embedding Strata in applications that manage their
-	// own Prometheus registries). If MetricsAddr is set and the value also
-	// implements prometheus.Gatherer, it is used to serve /metrics as well.
+	// own Prometheus registries). The first registration also sets the gatherer
+	// served by MetricsAddr when the registerer implements prometheus.Gatherer;
+	// otherwise /metrics falls back to prometheus.DefaultGatherer.
 	MetricsRegisterer prometheus.Registerer
 }
 
