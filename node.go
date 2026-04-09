@@ -1782,7 +1782,9 @@ func (n *Node) Txn(ctx context.Context, req TxnRequest) (TxnResponse, error) {
 	}
 	if e.Op == 0 {
 		// No-op branch: conditions evaluated but no writes needed.
-		curRev := n.nextRev
+		// Use the committed revision, not nextRev which may be ahead of what
+		// the commit loop has fsynced if concurrent writes are in flight.
+		curRev := n.db.Load().CurrentRevision()
 		n.mu.Unlock()
 		return TxnResponse{Succeeded: succeeded, Revision: curRev}, nil
 	}
@@ -1957,6 +1959,18 @@ func (n *Node) prepareTxn(req TxnRequest) (wal.Entry, bool, map[string]struct{},
 	}
 	if len(active) == 0 {
 		return wal.Entry{}, succeeded, nil, nil
+	}
+
+	if len(active) > 65535 {
+		return wal.Entry{}, false, nil, fmt.Errorf("txn: too many ops (%d), maximum is 65535", len(active))
+	}
+
+	seen := make(map[string]struct{}, len(active))
+	for _, r := range active {
+		if _, dup := seen[r.key]; dup {
+			return wal.Entry{}, false, nil, fmt.Errorf("txn: duplicate key %q in branch", r.key)
+		}
+		seen[r.key] = struct{}{}
 	}
 
 	n.nextRev++
