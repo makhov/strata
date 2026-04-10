@@ -45,7 +45,7 @@ Trace-level logging prints every WAL entry, follower ACK, and S3 operation — u
 The node can't reach S3 on startup.
 
 **Check:**
-- S3 credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or IRSA)
+- S3 credentials (`T4_S3_ACCESS_KEY_ID`, `T4_S3_SECRET_ACCESS_KEY`, or IRSA)
 - Bucket name and prefix (`--s3-bucket`, `--s3-prefix`)
 - Endpoint URL (`--s3-endpoint` for MinIO/Ceph)
 - Network connectivity from the node to S3

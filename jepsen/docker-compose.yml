@@ -8,10 +8,10 @@ x-node: &node
   cap_add: [NET_ADMIN, NET_RAW, SYS_PTRACE]
   networks: [jepsen]
   environment:
-    # AWS SDK credential chain picks these up automatically.
-    AWS_ACCESS_KEY_ID: "jepsen"
-    AWS_SECRET_ACCESS_KEY: "jepsen123"
-    AWS_DEFAULT_REGION: "us-east-1"   # MinIO ignores this but the SDK requires it
+    # T4-scoped S3 credentials — picked up via T4_S3_* env vars.
+    T4_S3_ACCESS_KEY_ID: "jepsen"
+    T4_S3_SECRET_ACCESS_KEY: "jepsen123"
+    T4_S3_REGION: "us-east-1"   # MinIO ignores this but the SDK requires it
   ulimits:
     nofile: { soft: 65536, hard: 65536 }
 

@@ -71,9 +71,9 @@ services:
       --s3-prefix data/
       --s3-endpoint http://minio:9000
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      AWS_DEFAULT_REGION: us-east-1
+      T4_S3_ACCESS_KEY_ID: minioadmin
+      T4_S3_SECRET_ACCESS_KEY: minioadmin
+      T4_S3_REGION: us-east-1
     ports:
       - "3379:3379"
     volumes:
@@ -96,9 +96,9 @@ volumes:
 x-t4-common: &t4-common
   image: ghcr.io/t4db/t4:latest
   environment:
-    AWS_ACCESS_KEY_ID: minioadmin
-    AWS_SECRET_ACCESS_KEY: minioadmin
-    AWS_DEFAULT_REGION: us-east-1
+    T4_S3_ACCESS_KEY_ID: minioadmin
+    T4_S3_SECRET_ACCESS_KEY: minioadmin
+    T4_S3_REGION: us-east-1
   depends_on:
     minio-init:
       condition: service_completed_successfully

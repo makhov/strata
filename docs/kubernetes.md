@@ -86,16 +86,16 @@ spec:
                 configMapKeyRef:
                   name: t4-config
                   key: s3_prefix
-            - name: AWS_ACCESS_KEY_ID
+            - name: T4_S3_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
                   name: t4-s3-credentials
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
+                  key: T4_S3_ACCESS_KEY_ID
+            - name: T4_S3_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: t4-s3-credentials
-                  key: AWS_SECRET_ACCESS_KEY
+                  key: T4_S3_SECRET_ACCESS_KEY
           ports:
             - name: etcd
               containerPort: 3379
@@ -213,16 +213,16 @@ spec:
                 configMapKeyRef:
                   name: t4-config
                   key: s3_prefix
-            - name: AWS_ACCESS_KEY_ID
+            - name: T4_S3_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
                   name: t4-s3-credentials
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
+                  key: T4_S3_ACCESS_KEY_ID
+            - name: T4_S3_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: t4-s3-credentials
-                  key: AWS_SECRET_ACCESS_KEY
+                  key: T4_S3_SECRET_ACCESS_KEY
           ports:
             - name: etcd
               containerPort: 3379

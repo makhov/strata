@@ -67,8 +67,8 @@ helm install t4 oci://ghcr.io/t4db/charts/t4 \
 
 ```bash
 kubectl create secret generic t4-s3-credentials \
-  --from-literal=AWS_ACCESS_KEY_ID=AKIA... \
-  --from-literal=AWS_SECRET_ACCESS_KEY=...
+  --from-literal=T4_S3_ACCESS_KEY_ID=AKIA... \
+  --from-literal=T4_S3_SECRET_ACCESS_KEY=...
 
 helm install t4 oci://ghcr.io/t4db/charts/t4 \
   --set s3.bucket=my-bucket \
