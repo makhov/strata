@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/t4db/t4/internal/peer"
 	"github.com/t4db/t4/internal/wal"
@@ -64,6 +67,7 @@ func TestStreamDelivery(t *testing.T) {
 	for i := int64(1); i <= n; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(1, n)
 
 	for i := int64(1); i <= n; i++ {
 		select {
@@ -87,6 +91,7 @@ func TestCatchUp(t *testing.T) {
 	for i := int64(1); i <= 3; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(1, 3)
 
 	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -116,6 +121,7 @@ func TestCatchUp(t *testing.T) {
 
 	// Broadcast a live entry and verify it arrives.
 	srv.Broadcast(makeEntry(4))
+	srv.BroadcastCommit(4, 4)
 	select {
 	case e := <-received:
 		if e.Revision != 4 {
@@ -135,6 +141,7 @@ func TestResyncRequired(t *testing.T) {
 	for i := int64(1); i <= 10; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(1, 10)
 
 	addr := startServer(t, srv)
 	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
@@ -247,6 +254,7 @@ func TestMultipleFollowers(t *testing.T) {
 
 	srv.Broadcast(makeEntry(1))
 	srv.Broadcast(makeEntry(2))
+	srv.BroadcastCommit(1, 2)
 
 	for i, ch := range received {
 		for rev := int64(1); rev <= 2; rev++ {
@@ -271,6 +279,7 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 	for i := int64(1); i <= 5; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(1, 5)
 
 	addr := startServer(t, srv)
 	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
@@ -298,6 +307,7 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 	for i := int64(6); i <= 8; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(6, 8)
 
 	<-done
 
@@ -306,5 +316,177 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 		if revisions[i] <= revisions[i-1] {
 			t.Errorf("non-monotonic revisions at index %d: %v -> %v", i, revisions[i-1], revisions[i])
 		}
+	}
+}
+
+func TestFollowerAppliesOnlyAfterCommit(t *testing.T) {
+	srv := peer.NewServer(1000, nil)
+	addr := startServer(t, srv)
+
+	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	applied := make(chan wal.Entry, 4)
+	go func() {
+		_ = cli.Follow(ctx, 1, noopWAL, func(entries []wal.Entry) error {
+			for _, e := range entries {
+				applied <- e
+			}
+			return nil
+		})
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	srv.Broadcast(makeEntry(1))
+
+	select {
+	case e := <-applied:
+		t.Fatalf("entry applied before commit: rev=%d", e.Revision)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	srv.BroadcastCommit(1, 1)
+	select {
+	case e := <-applied:
+		if e.Revision != 1 {
+			t.Fatalf("applied wrong revision: got %d", e.Revision)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for committed entry")
+	}
+}
+
+func TestCommitWithoutStagedEntryTriggersResyncRequired(t *testing.T) {
+	srv := peer.NewServer(1000, nil)
+	addr := startServer(t, srv)
+
+	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- cli.Follow(ctx, 1, noopWAL, func([]wal.Entry) error { return nil })
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	srv.BroadcastCommit(1, 1)
+
+	select {
+	case err := <-errCh:
+		if !peer.IsResyncRequired(err) {
+			t.Fatalf("expected resync_required, got %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for resync error")
+	}
+}
+
+type flakyReplayServer struct {
+	mu       sync.Mutex
+	attempts int
+}
+
+func (s *flakyReplayServer) Follow(_ *peer.FollowRequest, stream peer.WalStream_FollowServer) error {
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	s.mu.Unlock()
+
+	switch attempt {
+	case 1:
+		// First attempt: send staged-but-uncommitted entries, then drop the stream.
+		for _, rev := range []int64{1, 2} {
+			if err := stream.Send(peer.EntryToMsg(makeEntry(rev))); err != nil {
+				return err
+			}
+		}
+		return status.Error(codes.Unavailable, "injected_disconnect")
+	case 2:
+		// Replay the same entries after reconnect, then send the commit marker.
+		for _, rev := range []int64{1, 2} {
+			if err := stream.Send(peer.EntryToMsg(makeEntry(rev))); err != nil {
+				return err
+			}
+		}
+		if err := stream.Send(&peer.WalEntryMsg{Commit: true, CommitStartRevision: 1, CommitRevision: 2}); err != nil {
+			return err
+		}
+		// Wait for the follower ACK so the client can complete normally.
+		ack := new(peer.AckMsg)
+		if err := stream.RecvMsg(ack); err != nil {
+			return err
+		}
+		if ack.Revision != 2 {
+			return fmt.Errorf("got ack revision %d, want 2", ack.Revision)
+		}
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	default:
+		return status.Error(codes.Unavailable, "unexpected_extra_attempt")
+	}
+}
+
+func (s *flakyReplayServer) Forward(context.Context, *peer.ForwardRequest) (*peer.ForwardResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "unused")
+}
+
+func (s *flakyReplayServer) GoodBye(context.Context, *peer.GoodByeRequest) (*peer.GoodByeResponse, error) {
+	return &peer.GoodByeResponse{}, nil
+}
+
+func TestReconnectReplaysUncommittedEntriesOnlyOnce(t *testing.T) {
+	addr := startServer(t, &flakyReplayServer{})
+
+	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		applied  []int64
+		walCalls int
+	)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- cli.Follow(
+			ctx,
+			1,
+			func(entries []wal.Entry) error {
+				mu.Lock()
+				walCalls++
+				mu.Unlock()
+				return nil
+			},
+			func(entries []wal.Entry) error {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, e := range entries {
+					applied = append(applied, e.Revision)
+				}
+				cancel()
+				return nil
+			},
+		)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != context.Canceled && err != context.DeadlineExceeded {
+			t.Fatalf("Follow: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for follow to finish")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if walCalls != 1 {
+		t.Fatalf("walFn called %d times, want 1", walCalls)
+	}
+	if len(applied) != 2 || applied[0] != 1 || applied[1] != 2 {
+		t.Fatalf("applied revisions = %v, want [1 2]", applied)
 	}
 }

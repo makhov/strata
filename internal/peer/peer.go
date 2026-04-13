@@ -57,7 +57,7 @@ func IsLeaderShutdown(err error) bool {
 // Codec encodes peer gRPC messages. Hot-path messages (WalEntryMsg, AckMsg)
 // use a compact binary format; all other messages fall back to JSON.
 //
-// WalEntryMsg wire layout (little-endian, 50-byte fixed header):
+// WalEntryMsg wire layout (little-endian, 68-byte fixed header):
 //
 //	[revision  : int64  ]  @0
 //	[term      : uint64 ]  @8
@@ -65,11 +65,14 @@ func IsLeaderShutdown(err error) bool {
 //	[prevRev   : int64  ]  @24
 //	[lease     : int64  ]  @32
 //	[op        : uint8  ]  @40
-//	[flags     : uint8  ]  @41  bit0 = shutdown
-//	[keyLen    : uint32 ]  @42
-//	[key bytes ]           @46
-//	[valueLen  : uint32 ]  @46+keyLen
-//	[value bytes]          @50+keyLen
+//	[flags     : uint8  ]  @41  bit0 = shutdown, bit1 = commit
+//	[reserved  : uint16 ]  @42
+//	[keyLen      : uint32 ]  @44
+//	[commitRev   : int64  ]  @48
+//	[commitStart : int64  ]  @56
+//	[key bytes   ]           @64
+//	[valueLen    : uint32 ]  @64+keyLen
+//	[value bytes ]           @68+keyLen
 //
 // AckMsg wire layout:
 //
@@ -106,7 +109,7 @@ func (Codec) Unmarshal(data []byte, v interface{}) error {
 	}
 }
 
-const walEntryMsgFixedSize = 50
+const walEntryMsgFixedSize = 68
 
 func marshalWalEntryMsg(m *WalEntryMsg) ([]byte, error) {
 	kl := len(m.Key)
@@ -121,10 +124,15 @@ func marshalWalEntryMsg(m *WalEntryMsg) ([]byte, error) {
 	if m.Shutdown {
 		buf[41] = 1
 	}
-	binary.LittleEndian.PutUint32(buf[42:], uint32(kl))
-	copy(buf[46:], m.Key)
-	binary.LittleEndian.PutUint32(buf[46+kl:], uint32(vl))
-	copy(buf[50+kl:], m.Value)
+	if m.Commit {
+		buf[41] |= 1 << 1
+	}
+	binary.LittleEndian.PutUint32(buf[44:], uint32(kl))
+	binary.LittleEndian.PutUint64(buf[48:], uint64(m.CommitRevision))
+	binary.LittleEndian.PutUint64(buf[56:], uint64(m.CommitStartRevision))
+	copy(buf[64:], m.Key)
+	binary.LittleEndian.PutUint32(buf[64+kl:], uint32(vl))
+	copy(buf[68+kl:], m.Value)
 	return buf, nil
 }
 
@@ -138,18 +146,21 @@ func unmarshalWalEntryMsg(data []byte, m *WalEntryMsg) error {
 	m.PrevRevision = int64(binary.LittleEndian.Uint64(data[24:]))
 	m.Lease = int64(binary.LittleEndian.Uint64(data[32:]))
 	m.Op = data[40]
-	m.Shutdown = data[41] != 0
-	kl := int(binary.LittleEndian.Uint32(data[42:]))
+	m.Shutdown = data[41]&1 != 0
+	m.Commit = data[41]&(1<<1) != 0
+	kl := int(binary.LittleEndian.Uint32(data[44:]))
+	m.CommitRevision = int64(binary.LittleEndian.Uint64(data[48:]))
+	m.CommitStartRevision = int64(binary.LittleEndian.Uint64(data[56:]))
 	if len(data) < walEntryMsgFixedSize+kl {
 		return fmt.Errorf("peer: WalEntryMsg truncated at key (need %d have %d)", walEntryMsgFixedSize+kl, len(data))
 	}
-	m.Key = string(data[46 : 46+kl])
-	vl := int(binary.LittleEndian.Uint32(data[46+kl:]))
+	m.Key = string(data[64 : 64+kl])
+	vl := int(binary.LittleEndian.Uint32(data[64+kl:]))
 	if len(data) < walEntryMsgFixedSize+kl+vl {
 		return fmt.Errorf("peer: WalEntryMsg truncated at value (need %d have %d)", walEntryMsgFixedSize+kl+vl, len(data))
 	}
 	m.Value = make([]byte, vl)
-	copy(m.Value, data[50+kl:])
+	copy(m.Value, data[68+kl:])
 	return nil
 }
 
@@ -173,15 +184,18 @@ type AckMsg struct {
 // Shutdown is a special flag: when true the leader is shutting down gracefully
 // and the follower should start a TakeOver election immediately.
 type WalEntryMsg struct {
-	Revision       int64  `json:"revision"`
-	Term           uint64 `json:"term"`
-	Op             uint8  `json:"op"`
-	Key            string `json:"key"`
-	Value          []byte `json:"value"`
-	Lease          int64  `json:"lease"`
-	CreateRevision int64  `json:"create_revision"`
-	PrevRevision   int64  `json:"prev_revision"`
-	Shutdown       bool   `json:"shutdown,omitempty"`
+	Revision            int64  `json:"revision"`
+	Term                uint64 `json:"term"`
+	Op                  uint8  `json:"op"`
+	Key                 string `json:"key"`
+	Value               []byte `json:"value"`
+	Lease               int64  `json:"lease"`
+	CreateRevision      int64  `json:"create_revision"`
+	PrevRevision        int64  `json:"prev_revision"`
+	CommitRevision      int64  `json:"commit_revision,omitempty"`
+	CommitStartRevision int64  `json:"commit_start_revision,omitempty"`
+	Commit              bool   `json:"commit,omitempty"`
+	Shutdown            bool   `json:"shutdown,omitempty"`
 }
 
 func EntryToMsg(e *wal.Entry) *WalEntryMsg {
