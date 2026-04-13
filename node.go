@@ -2197,10 +2197,11 @@ func (n *Node) commitLoop(ctx context.Context) {
 				n.peerSrv.Broadcast(&req.entry)
 			}
 
+			startRev := batch[0].entry.Revision
 			maxRev := batch[len(batch)-1].entry.Revision
 			err = <-walErrC
 			if err == nil {
-				n.peerSrv.BroadcastCommit(maxRev)
+				n.peerSrv.BroadcastCommit(startRev, maxRev)
 
 				// Wait for follower ACKs according to the configured policy.
 				// Use the commit loop's own context (node lifetime), NOT batchCtx:
@@ -2727,22 +2728,31 @@ func (n *Node) restoreDBIfBehindCheckpoint(ctx context.Context) (bool, error) {
 	// ── Phase 2: swap Pebble directories under fenceMu.Lock + readMu.Lock ───
 	// fenceMu.Lock drains in-flight writes (which hold fenceMu.RLock).
 	//
-	// We close the old store before acquiring readMu.Lock. Close calls
-	// SignalClose(), which unblocks any goroutine blocked in WaitForRevision
+	// We first signal-close the old store before acquiring readMu.Lock.
+	// SignalClose unblocks any goroutine blocked in WaitForRevision
 	// (those goroutines hold readMu.RLock while waiting). If we acquired
 	// readMu.Lock first, WaitForRevision callers would never release their
 	// RLocks → deadlock.
 	//
-	// After Close(), readMu.Lock drains the remaining in-flight reads
+	// After SignalClose, readMu.Lock drains the remaining in-flight reads
 	// (Get/List and any WaitForRevision callers that were unblocked by
-	// SignalClose). We hold readMu until n.db.Store(newDB) so that no new
-	// read can load the old (now-removed) path from n.db.
+	// SignalClose). We then close the old store while still holding readMu,
+	// so no new read can load the old *Store after Pebble has been closed.
+	// We keep readMu until n.db.Store(newDB) so no read can observe the
+	// closed store pointer during the on-disk swap.
 	//
 	// Lock order: fenceMu → readMu (no other code path acquires them in the
 	// reverse order, so no deadlock is possible here).
 	n.fenceMu.Lock()
-	n.db.Load().Close() // unblocks WaitForRevision waiters before we take readMu.Lock
+	oldDB := n.db.Load()
+	oldDB.SignalClose() // unblocks WaitForRevision waiters before we take readMu.Lock
 	n.readMu.Lock()
+	if rerr := oldDB.Close(); rerr != nil {
+		n.readMu.Unlock()
+		n.fenceMu.Unlock()
+		os.RemoveAll(tmpDir)
+		return false, fmt.Errorf("close old pebble before restore swap: %w", rerr)
+	}
 	if rerr := os.RemoveAll(pebbleDir); rerr != nil {
 		n.readMu.Unlock()
 		n.fenceMu.Unlock()

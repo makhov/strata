@@ -67,7 +67,7 @@ func TestStreamDelivery(t *testing.T) {
 	for i := int64(1); i <= n; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
-	srv.BroadcastCommit(n)
+	srv.BroadcastCommit(1, n)
 
 	for i := int64(1); i <= n; i++ {
 		select {
@@ -91,6 +91,7 @@ func TestCatchUp(t *testing.T) {
 	for i := int64(1); i <= 3; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(1, 3)
 
 	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -120,7 +121,7 @@ func TestCatchUp(t *testing.T) {
 
 	// Broadcast a live entry and verify it arrives.
 	srv.Broadcast(makeEntry(4))
-	srv.BroadcastCommit(4)
+	srv.BroadcastCommit(4, 4)
 	select {
 	case e := <-received:
 		if e.Revision != 4 {
@@ -140,6 +141,7 @@ func TestResyncRequired(t *testing.T) {
 	for i := int64(1); i <= 10; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(1, 10)
 
 	addr := startServer(t, srv)
 	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
@@ -252,7 +254,7 @@ func TestMultipleFollowers(t *testing.T) {
 
 	srv.Broadcast(makeEntry(1))
 	srv.Broadcast(makeEntry(2))
-	srv.BroadcastCommit(2)
+	srv.BroadcastCommit(1, 2)
 
 	for i, ch := range received {
 		for rev := int64(1); rev <= 2; rev++ {
@@ -277,6 +279,7 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 	for i := int64(1); i <= 5; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(1, 5)
 
 	addr := startServer(t, srv)
 	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
@@ -304,7 +307,7 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 	for i := int64(6); i <= 8; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
-	srv.BroadcastCommit(8)
+	srv.BroadcastCommit(6, 8)
 
 	<-done
 
@@ -343,7 +346,7 @@ func TestFollowerAppliesOnlyAfterCommit(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	srv.BroadcastCommit(1)
+	srv.BroadcastCommit(1, 1)
 	select {
 	case e := <-applied:
 		if e.Revision != 1 {
@@ -368,7 +371,7 @@ func TestCommitWithoutStagedEntryTriggersResyncRequired(t *testing.T) {
 	}()
 
 	time.Sleep(100 * time.Millisecond)
-	srv.BroadcastCommit(1)
+	srv.BroadcastCommit(1, 1)
 
 	select {
 	case err := <-errCh:
@@ -407,7 +410,7 @@ func (s *flakyReplayServer) Follow(_ *peer.FollowRequest, stream peer.WalStream_
 				return err
 			}
 		}
-		if err := stream.Send(&peer.WalEntryMsg{Commit: true, CommitRevision: 2}); err != nil {
+		if err := stream.Send(&peer.WalEntryMsg{Commit: true, CommitStartRevision: 1, CommitRevision: 2}); err != nil {
 			return err
 		}
 		// Wait for the follower ACK so the client can complete normally.

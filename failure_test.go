@@ -1281,7 +1281,20 @@ func TestNetworkPartitionNoSplitBrain(t *testing.T) {
 	}
 	t.Cleanup(func() { followerNode.Close() })
 
-	// Phase 1: write and verify replication to confirm the follower is connected.
+	// Establish the replication stream before the main assertions. Under -race on
+	// CI the follower can still be finishing its initial connect/resync when the
+	// phase-1 burst starts, which makes this test flaky even though the
+	// partition-handling behavior is correct.
+	seedRev, err := leaderNode.Put(ctx, "/partition/seed", []byte("seed"), 0)
+	if err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+	if err := followerNode.WaitForRevision(ctx, seedRev); err != nil {
+		t.Fatalf("follower WaitForRevision seed: %v", err)
+	}
+
+	// Phase 1: write and verify replication to confirm the follower stays caught
+	// up once the stream is established.
 	const phase1 = 10
 	var lastRev int64
 	for i := 0; i < phase1; i++ {

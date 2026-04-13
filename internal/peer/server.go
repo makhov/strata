@@ -37,6 +37,7 @@ const (
 type Server struct {
 	mu              sync.Mutex
 	buf             *entryBuffer
+	pending         []*wal.Entry
 	followers       map[string]chan *WalEntryMsg
 	followerAckRevs map[string]int64 // last ACK'd revision per follower
 	maxBroadcastRev int64            // highest revision sent via Broadcast
@@ -117,10 +118,7 @@ func (s *Server) SetForwardHandler(h ForwardHandler) {
 // Called by the leader after every successful appendAndApply.
 func (s *Server) Broadcast(e *wal.Entry) {
 	s.mu.Lock()
-	s.buf.push(e)
-	if e.Revision > s.maxBroadcastRev {
-		s.maxBroadcastRev = e.Revision
-	}
+	s.pending = append(s.pending, e)
 	var toKick []string
 	for id, ch := range s.followers {
 		select {
@@ -143,10 +141,27 @@ func (s *Server) Broadcast(e *wal.Entry) {
 
 // BroadcastCommit tells followers that all entries up to rev are now
 // committed by the leader and may be made visible locally.
-func (s *Server) BroadcastCommit(rev int64) {
+func (s *Server) BroadcastCommit(startRev, rev int64) {
 	s.mu.Lock()
+	// Move only the committed revision range into the replay buffer.
+	keep := s.pending[:0]
+	for _, e := range s.pending {
+		switch {
+		case e.Revision < startRev:
+			// An older uncommitted entry was superseded by a later committed
+			// range. Drop it so reconnect snapshots never replay aborted writes.
+		case e.Revision <= rev:
+			s.buf.push(e)
+			if e.Revision > s.maxBroadcastRev {
+				s.maxBroadcastRev = e.Revision
+			}
+		default:
+			keep = append(keep, e)
+		}
+	}
+	s.pending = keep
 	var toKick []string
-	msg := &WalEntryMsg{Commit: true, CommitRevision: rev}
+	msg := &WalEntryMsg{Commit: true, CommitStartRevision: startRev, CommitRevision: rev}
 	for id, ch := range s.followers {
 		select {
 		case ch <- msg:
@@ -351,7 +366,11 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 		}
 	}
 	if len(snapshot) > 0 {
-		if err := stream.Send(&WalEntryMsg{Commit: true, CommitRevision: snapshot[len(snapshot)-1].Revision}); err != nil {
+		if err := stream.Send(&WalEntryMsg{
+			Commit:              true,
+			CommitStartRevision: snapshot[0].Revision,
+			CommitRevision:      snapshot[len(snapshot)-1].Revision,
+		}); err != nil {
 			return err
 		}
 	}
