@@ -78,15 +78,9 @@ type uploadTask struct {
 	objectKey string
 }
 
-// Open opens (or creates) the WAL directory and returns a ready WAL.
-// Callers must call Start to begin background processing.
-func Open(dir string, term uint64, startRev int64, opts ...Option) (*WAL, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("wal: mkdir %q: %w", dir, err)
-	}
+// New returns a WAL configured with opts. Call Open before use.
+func New(opts ...Option) *WAL {
 	w := &WAL{
-		dir:        dir,
-		term:       term,
 		segMaxSize: DefaultSegmentMaxSize,
 		segMaxAge:  DefaultSegmentMaxAge,
 		uploadC:    make(chan uploadTask, 64),
@@ -97,12 +91,37 @@ func Open(dir string, term uint64, startRev int64, opts ...Option) (*WAL, error)
 	if w.log == nil {
 		w.log = stdlibLogger{}
 	}
-	sw, err := OpenSegmentWriter(dir, term, startRev)
-	if err != nil {
+	return w
+}
+
+// Open opens (or creates) the WAL directory and returns a ready WAL.
+// Callers must call Start to begin background processing.
+func Open(dir string, term uint64, startRev int64, opts ...Option) (*WAL, error) {
+	w := New(opts...)
+	if err := w.Open(dir, term, startRev); err != nil {
 		return nil, err
 	}
-	w.active = sw
 	return w, nil
+}
+
+// Open opens (or creates) the WAL directory and prepares the active segment.
+// Callers must call Start to begin background processing.
+func (w *WAL) Open(dir string, term uint64, startRev int64) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("wal: mkdir %q: %w", dir, err)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.dir = dir
+	w.term = term
+	w.closed = false
+	w.uploadC = make(chan uploadTask, 64)
+	sw, err := OpenSegmentWriter(dir, term, startRev)
+	if err != nil {
+		return err
+	}
+	w.active = sw
+	return nil
 }
 
 // Option configures a WAL.

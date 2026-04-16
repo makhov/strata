@@ -26,15 +26,6 @@ import (
 	"github.com/t4db/t4/pkg/object"
 )
 
-// walWriter is the subset of wal.WAL used by Node. The interface decouples Node
-// from the concrete WAL implementation and allows fault injection in tests.
-type walWriter interface {
-	Append(e *wal.Entry) error
-	AppendBatch(ctx context.Context, entries []*wal.Entry) error
-	SealAndFlush(nextRev int64) error
-	Close() error
-}
-
 // Sentinel errors.
 var (
 	ErrKeyExists = errors.New("t4: key already exists")
@@ -178,7 +169,7 @@ type Node struct {
 	role atomic.Int32 // stores nodeRole values; use loadRole/storeRole
 
 	db  atomic.Pointer[istore.Store]
-	wal walWriter // non-nil on leader/single; non-nil on follower (local WAL, no uploader)
+	wal WALWriter // non-nil on leader/single; non-nil on follower (local WAL, no uploader)
 
 	// mu serialises all leader writes for CAS safety and role transitions.
 	mu sync.Mutex
@@ -358,6 +349,7 @@ func Open(cfg Config) (*Node, error) {
 	pebbleOpts = append(pebbleOpts, func(o *pebble.Options) {
 		o.Logger = &pebbleLogger{log: log}
 	})
+	pebbleOpts = append(pebbleOpts, cfg.PebbleOptions...)
 	if cfg.ObjectStore != nil {
 		sstUp = istore.NewSSTUploader(cfg.ObjectStore, pebbleDir)
 		pebbleOpts = append(pebbleOpts, sstUp.PebbleOption())
@@ -401,14 +393,20 @@ func Open(cfg Config) (*Node, error) {
 	if cfg.ObjectStore != nil && *cfg.WALSyncUpload {
 		opts = append(opts, wal.WithSyncUpload())
 	}
-	w, err := wal.Open(walDir, term, startRev+1, opts...)
-	if err != nil {
+	w := cfg.WAL
+	if w == nil {
+		w = wal.New(opts...)
+	}
+	if err := w.Open(walDir, term, startRev+1); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("t4: open wal: %w", err)
 	}
 
 	// ── Replay local WAL ─────────────────────────────────────────────────────
-	if err := replayLocal(db, walDir, startRev, log); err != nil {
+	if !cfg.SkipLocalWALReplay {
+		err = replayLocal(db, walDir, startRev, log)
+	}
+	if err != nil {
 		w.Close()
 		db.Close()
 		return nil, fmt.Errorf("t4: local WAL replay: %w", err)
@@ -529,12 +527,11 @@ func Open(cfg Config) (*Node, error) {
 				}
 			}
 			w.Close()
-			freshW, rerr := wal.Open(walDir, newTerm, freshDB.CurrentRevision()+1, opts...)
-			if rerr != nil {
+			if rerr := w.Open(walDir, newTerm, freshDB.CurrentRevision()+1); rerr != nil {
 				freshDB.Close()
 				return nil, fmt.Errorf("t4: reopen wal after GC-gap fix: %w", rerr)
 			}
-			db, w, term, startRev = freshDB, freshW, newTerm, freshDB.CurrentRevision()
+			db, term, startRev = freshDB, newTerm, freshDB.CurrentRevision()
 			log.Infof("t4: checkpoint refreshed to rev=%d (term=%d)", startRev, term)
 		}
 	}
@@ -563,7 +560,9 @@ func Open(cfg Config) (*Node, error) {
 		n.checkpointTriggerC = make(chan struct{}, 1)
 	}
 
-	w.Start(bgCtx)
+	if starter, ok := w.(interface{ Start(context.Context) }); ok {
+		starter.Start(bgCtx)
+	}
 
 	// ── Determine role ───────────────────────────────────────────────────────
 	if cfg.PeerListenAddr == "" || cfg.ObjectStore == nil {
