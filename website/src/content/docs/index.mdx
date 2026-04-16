@@ -1,112 +1,136 @@
 ---
 title: T4
-description: An S3-durable key-value store with etcd v3 compatibility — run as a server or embed in your Go app.
+description: A key-value datastore with local reads, S3-backed recovery, and an etcd v3-compatible API.
 template: splash
 hero:
-  tagline: S3-durable key-value storage with etcd v3 compatibility. Run as a standalone server or embed directly in Go.
-  actions:
-    - text: Get Started
-      link: /getting-started/
-      icon: right-arrow
-      variant: primary
-    - text: View on GitHub
-      link: https://github.com/t4db/t4
-      icon: github
-      variant: minimal
+tagline: A key-value datastore with local reads, S3-backed recovery, and an etcd v3-compatible API.
+actions:
+- text: Get Started
+link: /getting-started/
+icon: right-arrow
+variant: primary
+- text: View on GitHub
+link: https://github.com/t4db/t4
+icon: github
+variant: minimal
 ---
 
-import { Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
+
+
+import {Card, CardGrid, TabItem, Tabs} from '@astrojs/starlight/components';
 
 <div style="margin: 3rem 0 2rem;">
 
-<Tabs>
-  <TabItem label="Standalone server">
+    <Tabs>
+        <TabItem label="Standalone server">
 
-```bash
-# Install
-go install github.com/t4db/t4/cmd/t4@latest
+            ```bash
+            # Install
+            go install github.com/t4db/t4/cmd/t4@latest
 
-# Start — S3-durable, etcd-compatible
-t4 run \
-  --data-dir  /var/lib/t4 \
-  --listen    0.0.0.0:3379   \
-  --s3-bucket my-bucket      \
-  --s3-prefix t4/
+            # Start — S3-durable, etcd-compatible
+            t4 run \
+            --data-dir /var/lib/t4 \
+            --listen 0.0.0.0:3379 \
+            --s3-bucket my-bucket \
+            --s3-prefix t4/
 
-# Use any etcd v3 client
-etcdctl --endpoints=localhost:3379 put /config/timeout 30s
-etcdctl --endpoints=localhost:3379 get /config/timeout
-```
+            # Use any etcd v3 client
+            etcdctl --endpoints=localhost:3379 put /config/timeout 30s
+            etcdctl --endpoints=localhost:3379 get /config/timeout
+            ```
 
-  </TabItem>
-  <TabItem label="Go library">
+        </TabItem>
+        <TabItem label="Go library">
 
-```go
-import "github.com/t4db/t4"
+            ```go
+            import "github.com/t4db/t4"
 
-node, err := t4.Open(t4.Config{
-    DataDir:     "/var/lib/myapp/t4",
-    ObjectStore: s3Store, // nil for local-only
-})
-defer node.Close()
+            node, err := t4.Open(t4.Config{
+            DataDir:     "/var/lib/myapp/t4",
+            ObjectStore: s3Store, // nil for local-only
+        })
+            defer node.Close()
 
-rev, _ := node.Put(ctx, "/config/timeout", []byte("30s"), 0)
-kv, _  := node.Get("/config/timeout")
-```
+            rev, _ := node.Put(ctx, "/config/timeout", []byte("30s"), 0)
+            kv, _ := node.Get("/config/timeout")
+            ```
 
-  </TabItem>
-</Tabs>
+        </TabItem>
+    </Tabs>
 
 </div>
+
+## What is T4?
+
+T4 is a key-value datastore with its own storage and replication model. It stores the live database locally in Pebble, exposes an etcd v3-compatible gRPC API for existing clients, and uploads WAL/checkpoint files to S3-compatible storage for recovery and branching.
+
+The design is optimized around metadata-style workloads: configuration, service metadata, coordination, distributed locks, Kubernetes-style metadata, and other key-value data where local reads plus object-store recovery are useful.
+
+## Example scenarios
+
+| Scenario | Why T4 may fit |
+|---|---|
+| Kubernetes datastore  | Kubernetes talks to the datastore through the etcd v3 API; T4 implements the core KV, Watch, Lease, and Auth services |
+| Small control planes, schedulers, operators, and internal platforms | Existing etcd clients work, while recovery is tied to an object-store bucket |
+| Embedded Go applications | `t4.Open(cfg)` gives local reads, watches, transactions, and optional S3-backed durability without a sidecar |
+| Preview and test environments | Branch a database at a checkpoint without copying S3 objects |
+
+Tradeoffs to consider: etcd has a more mature operations ecosystem, full member-management APIs, snapshot tooling, and lower single-writer latency in some workloads.
 
 ## Why T4?
 
 <CardGrid stagger>
-  <Card title="etcd v3 compatible" icon="approve-check">
-    The standalone binary speaks the etcd v3 gRPC protocol. Drop in for most cases as an etcd replacement — `etcdctl`, the Go client, and any etcd v3 library work unchanged. See the [compatibility guide](/etcd-migration/) for the supported subset.
-  </Card>
-  <Card title="S3-durable" icon="cloud-upload">
-    WAL segments and checkpoints are uploaded to S3. A node that loses its disk recovers automatically on next boot — no manual intervention.
-  </Card>
-  <Card title="Multi-node clustering" icon="bars">
-    Leader election via S3 atomic locks — no Raft, no ZooKeeper, no cluster membership config. Any node can join or leave at any time.
-  </Card>
-  <Card title="Embeddable Go library" icon="puzzle">
-    One `t4.Open(cfg)` call. No sidecar process, no daemon. Run the store inside your binary for zero-overhead local reads.
-  </Card>
-  <Card title="Zero-copy branching" icon="fork">
-    Fork a database at any checkpoint without copying S3 objects. Shared SSTs are content-addressed and deduplicated automatically.
-  </Card>
-  <Card title="Prometheus metrics" icon="information">
-    Built-in `/metrics`, `/healthz`, and `/readyz` endpoints. Drop into your existing observability stack.
-  </Card>
+    <Card title="etcd v3 compatible" icon="approve-check">
+        The standalone binary speaks the etcd v3 gRPC protocol. Use `etcdctl`, the Go client, Kubernetes-style clients,
+        and most etcd v3 libraries unchanged. See the [compatibility guide](/etcd-migration/) for the supported subset.
+    </Card>
+    <Card title="S3-durable" icon="cloud-upload">
+        S3 is the recovery log, not the read path. Reads are served from local Pebble; WAL segments and checkpoints are
+        uploaded to S3 so a replacement node can restore automatically.
+    </Card>
+    <Card title="Multi-node clustering" icon="bars">
+        Leader election via S3 atomic locks — no Raft, no ZooKeeper, no cluster membership config. Any node can join or
+        leave at any time.
+    </Card>
+    <Card title="Embeddable Go library" icon="puzzle">
+        One `t4.Open(cfg)` call. No sidecar process, no daemon. Run the store inside your binary for zero-overhead local
+        reads.
+    </Card>
+    <Card title="Zero-copy branching" icon="fork">
+        Fork a database at any checkpoint without copying S3 objects. Shared SSTs are content-addressed and deduplicated
+        automatically.
+    </Card>
+    <Card title="Prometheus metrics" icon="information">
+        Built-in `/metrics`, `/healthz`, and `/readyz` endpoints. Drop into your existing observability stack.
+    </Card>
 </CardGrid>
 
 ## Install
 
 <Tabs>
-  <TabItem label="Standalone binary">
+    <TabItem label="Standalone binary">
 
-```bash
-go install github.com/t4db/t4/cmd/t4@latest
-```
+        ```bash
+        go install github.com/t4db/t4/cmd/t4@latest
+        ```
 
-Or pull the Docker image:
+        Or pull the Docker image:
 
-```bash
-docker pull ghcr.io/t4db/t4:latest
-```
+        ```bash
+        docker pull ghcr.io/t4db/t4:latest
+        ```
 
-  </TabItem>
-  <TabItem label="Go library">
+    </TabItem>
+    <TabItem label="Go library">
 
-```bash
-go get github.com/t4db/t4
-```
+        ```bash
+        go get github.com/t4db/t4
+        ```
 
-Requires Go 1.22+.
+        Requires Go 1.22+.
 
-  </TabItem>
+    </TabItem>
 </Tabs>
 
 ## T4 vs etcd

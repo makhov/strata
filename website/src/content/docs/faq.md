@@ -7,14 +7,15 @@ description: Frequently asked questions about T4.
 
 ### When should I use T4 instead of etcd?
 
-Use T4 when you want one or more of:
+T4 emphasizes a different set of tradeoffs from etcd:
 
 - **Embedded operation** — run the store inside your binary with no separate process
 - **S3-backed disaster recovery** — survive total node loss by recovering from S3
 - **High write concurrency** — T4 outperforms etcd at 8+ concurrent writers
 - **Zero-copy branching** — fork a database at a checkpoint without copying S3 objects
 
-Use etcd when you need:
+etcd has strengths T4 does not try to hide:
+
 - Mature operational tooling and broad ecosystem support
 - Very low write latency at 1–4 concurrent writers (etcd's fixed 100 ms batch interval helps here)
 - etcd snapshot restore support
@@ -42,6 +43,14 @@ That said, it's a newer project than etcd. Evaluate it against your reliability 
 ---
 
 ## Storage and durability
+
+### Is T4 using S3 as the database?
+
+Not directly. T4 does not fetch every key from S3. The live database is local Pebble, so normal reads are local disk reads and normal writes append to a local WAL first.
+
+S3 is used for durable history and recovery: sealed WAL segments, checkpoints, the latest manifest pointer, and the leader lock. If a node disappears with its disk, a replacement node can restore the latest checkpoint from S3 and replay WAL segments from there.
+
+The design is optimized around metadata-style workloads rather than SQL queries, document access patterns, or analytical scans.
 
 ### What happens if the node loses its disk?
 

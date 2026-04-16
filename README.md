@@ -6,7 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-t4db.github.io-green)](https://t4db.github.io/t4/)
 
-An embeddable, S3-durable key-value store for Go, with an etcd-compatible standalone server.
+T4 is a small key-value datastore that serves reads from local Pebble and keeps its durable history in S3-compatible object storage.
+
+It exposes the etcd v3 API so existing etcd clients can talk to it, but the storage model is T4's own: local database, local WAL, follower replication, and S3-backed recovery.
+
+T4 is not "query S3 for every key". Reads are served from a local Pebble database. Writes go through a local WAL, are replicated to followers in cluster mode, and sealed WAL/checkpoint files are uploaded to S3 for recovery, branching, and disaster tolerance.
 
 - **Embedded-first** — `t4.Open(cfg)` is the entire API. No sidecar, no daemon.
 - **S3-durable** — WAL segments and periodic checkpoints are uploaded to S3. A node that loses its disk recovers automatically.
@@ -14,6 +18,17 @@ An embeddable, S3-durable key-value store for Go, with an etcd-compatible standa
 - **etcd v3 compatible** — The standalone binary speaks the etcd v3 gRPC protocol, including multi-key transactions.
 - **Twelve-factor config** — CLI flags can be supplied through `T4_*` environment variables.
 - **Branches** — Fork a database at any checkpoint with zero S3 copies. Each branch writes to its own prefix; shared SST files are deduplicated automatically.
+
+---
+
+## Example scenarios
+
+- Control planes, internal platforms, schedulers, operators, and service metadata that already use etcd-style clients.
+- Kubernetes datastore experiments where the application already speaks etcd v3 and object-store recovery is useful.
+- Embedded Go services that want local reads, watches, transactions, and optional S3-backed recovery without running a separate database process.
+- Preview, test, or branch environments that benefit from cheap point-in-time copies of metadata without copying the whole database.
+
+Tradeoffs to be aware of: etcd has a more mature operations ecosystem, full member-management APIs, snapshot tooling, and lower single-writer latency in some workloads.
 
 ---
 

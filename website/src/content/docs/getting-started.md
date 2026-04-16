@@ -9,7 +9,7 @@ T4 has two modes. Pick the one that fits your use case:
 
 | | Standalone server | Go library |
 |---|---|---|
-| **Use case** | Drop-in etcd replacement, Kubernetes metadata store, any language | Go apps that want zero-overhead local reads, no sidecar |
+| **Common patterns** | Metadata over the etcd v3 API, Kubernetes datastore experiments, clients in any language | Go apps with local reads, no sidecar |
 | **Client** | Any etcd v3 client (`etcdctl`, Go, Python, Java, …) | Direct Go API calls |
 | **Install** | Binary or Docker image | `go get` |
 
