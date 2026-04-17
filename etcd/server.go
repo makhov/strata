@@ -14,6 +14,9 @@ import (
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -43,7 +46,9 @@ func New(node *t4.Node, authStore *auth.Store, tokens *auth.TokenStore) *Server 
 }
 
 // NewServerOptions returns the gRPC server options required for auth
-// enforcement (interceptors). Pass the returned options to grpc.NewServer.
+// enforcement (interceptors). Pass the returned options to grpc.NewServer
+// alongside TracingOptions — both use grpc.Chain*Interceptor internally
+// so they compose safely.
 // When authStore is nil the returned options are empty (no-op).
 func NewServerOptions(authStore *auth.Store, tokens *auth.TokenStore) []grpc.ServerOption {
 	if authStore == nil {
@@ -51,8 +56,29 @@ func NewServerOptions(authStore *auth.Store, tokens *auth.TokenStore) []grpc.Ser
 	}
 	unary, stream := auth.Interceptors(authStore, tokens)
 	return []grpc.ServerOption{
-		grpc.UnaryInterceptor(unary),
-		grpc.StreamInterceptor(stream),
+		grpc.ChainUnaryInterceptor(unary),
+		grpc.ChainStreamInterceptor(stream),
+	}
+}
+
+// TracingOptions returns gRPC server options that propagate OTel trace context
+// from etcd clients into T4's internal spans. An etcd client configured with
+// otelgrpc.UnaryClientInterceptor will automatically produce end-to-end traces
+// connecting the client call through T4's WAL and quorum wait spans.
+//
+// Pass the result to grpc.NewServer alongside NewServerOptions.
+//
+// When tp is nil, otel.GetTracerProvider() is used — a no-op if the embedding
+// application has not configured a global OTel provider.
+func TracingOptions(tp trace.TracerProvider) []grpc.ServerOption {
+	var opts []otelgrpc.Option
+	if tp != nil {
+		opts = append(opts, otelgrpc.WithTracerProvider(tp))
+	} else {
+		opts = append(opts, otelgrpc.WithTracerProvider(otel.GetTracerProvider()))
+	}
+	return []grpc.ServerOption{
+		grpc.StatsHandler(otelgrpc.NewServerHandler(opts...)),
 	}
 }
 
