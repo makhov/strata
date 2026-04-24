@@ -25,3 +25,17 @@ type Event struct {
 	KV     *KeyValue
 	PrevKV *KeyValue // nil for creates
 }
+
+// ScanOptions configures a paged scan over live keys.
+//
+// Prefix scans all live keys under Prefix. Start/End scan the half-open range
+// [Start, End). If Prefix is set, Start and End must be empty. After, when
+// set, skips all keys up to and including that key and is intended to be the
+// cursor returned by a previous Scan call.
+type ScanOptions struct {
+	Prefix string
+	Start  string
+	End    string
+	After  string
+	Limit  int
+}

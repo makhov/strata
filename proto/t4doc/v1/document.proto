@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package t4doc.v1;
+
+option go_package = "github.com/t4db/t4/t4doc/t4docpb;t4docpb";
+
+service DocumentStore {
+  rpc Insert(WriteDocumentRequest) returns (WriteDocumentResponse);
+  rpc Put(WriteDocumentRequest) returns (WriteDocumentResponse);
+  rpc Get(GetDocumentRequest) returns (GetDocumentResponse);
+  rpc Delete(DeleteDocumentRequest) returns (WriteDocumentResponse);
+  rpc Patch(PatchDocumentRequest) returns (WriteDocumentResponse);
+  rpc Find(FindRequest) returns (FindResponse);
+  rpc FindStream(FindRequest) returns (stream Document);
+  rpc Watch(WatchRequest) returns (stream Change);
+  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
+}
+
+message Document {
+  string collection = 1;
+  string id = 2;
+  bytes json = 3;
+  int64 revision = 4;
+  int64 create_revision = 5;
+}
+
+message WriteDocumentRequest {
+  string collection = 1;
+  string id = 2;
+  bytes json = 3;
+}
+
+message WriteDocumentResponse {
+  int64 revision = 1;
+}
+
+message GetDocumentRequest {
+  string collection = 1;
+  string id = 2;
+}
+
+message GetDocumentResponse {
+  Document document = 1;
+}
+
+message DeleteDocumentRequest {
+  string collection = 1;
+  string id = 2;
+}
+
+message PatchDocumentRequest {
+  string collection = 1;
+  string id = 2;
+  bytes merge_patch = 3;
+}
+
+message FindRequest {
+  string collection = 1;
+  Filter filter = 2;
+  int64 limit = 3;
+  bool allow_scan = 4;
+  int64 max_scan = 5;
+}
+
+message FindResponse {
+  repeated Document documents = 1;
+}
+
+message WatchRequest {
+  string collection = 1;
+  Filter filter = 2;
+}
+
+message Change {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    PUT = 1;
+    DELETE = 2;
+  }
+  Type type = 1;
+  Document document = 2;
+  int64 revision = 3;
+}
+
+message CreateIndexRequest {
+  string collection = 1;
+  IndexSpec index = 2;
+}
+
+message CreateIndexResponse {}
+
+message IndexSpec {
+  enum FieldType {
+    FIELD_TYPE_UNSPECIFIED = 0;
+    STRING = 1;
+    INT64 = 2;
+    BOOL = 3;
+  }
+  string name = 1;
+  string field = 2;
+  FieldType type = 3;
+}
+
+message Filter {
+  oneof kind {
+    EqFilter eq = 1;
+    AndFilter and = 2;
+  }
+}
+
+message EqFilter {
+  string field = 1;
+  Value value = 2;
+}
+
+message AndFilter {
+  repeated Filter filters = 1;
+}
+
+message Value {
+  oneof kind {
+    string string_value = 1;
+    int64 int64_value = 2;
+    bool bool_value = 3;
+  }
+}

@@ -24,5 +24,6 @@ func rootCmd() *cobra.Command {
 	root.AddCommand(gcCmd())
 	root.AddCommand(statusCmd())
 	root.AddCommand(inspectCmd())
+	root.AddCommand(docCmd())
 	return root
 }

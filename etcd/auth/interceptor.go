@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"go.etcd.io/etcd/api/v3/authpb"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -15,11 +16,20 @@ import (
 // Methods absent from this map require no key-level permission check (e.g.
 // Auth service methods, health checks).
 var methodPerm = map[string]PermType{
-	"/etcdserverpb.KV/Range":       READ,
-	"/etcdserverpb.KV/Put":         WRITE,
-	"/etcdserverpb.KV/DeleteRange": WRITE,
-	"/etcdserverpb.KV/Txn":         WRITE,
-	"/etcdserverpb.Watch/Watch":    READ,
+	"/etcdserverpb.KV/Range":              READ,
+	"/etcdserverpb.KV/Put":                WRITE,
+	"/etcdserverpb.KV/DeleteRange":        WRITE,
+	"/etcdserverpb.KV/Txn":                WRITE,
+	"/etcdserverpb.Watch/Watch":           READ,
+	"/t4doc.v1.DocumentStore/Get":         READ,
+	"/t4doc.v1.DocumentStore/Find":        READ,
+	"/t4doc.v1.DocumentStore/FindStream":  READ,
+	"/t4doc.v1.DocumentStore/Watch":       READ,
+	"/t4doc.v1.DocumentStore/Insert":      WRITE,
+	"/t4doc.v1.DocumentStore/Put":         WRITE,
+	"/t4doc.v1.DocumentStore/Delete":      WRITE,
+	"/t4doc.v1.DocumentStore/Patch":       WRITE,
+	"/t4doc.v1.DocumentStore/CreateIndex": WRITE,
 }
 
 // openMethods are always allowed regardless of auth state (auth bootstrapping
@@ -114,6 +124,32 @@ func tokenFromCtx(ctx context.Context, tokens *TokenStore) (string, error) {
 		return "", status.Error(codes.Unauthenticated, "invalid or expired token")
 	}
 	return username, nil
+}
+
+// CheckDocumentPermission validates the current token and checks collection
+// access using the virtual key prefix "/doc/<collection>/".
+func CheckDocumentPermission(ctx context.Context, store *Store, tokens *TokenStore, collection string, write bool) error {
+	if store == nil || !store.IsEnabled() {
+		return nil
+	}
+	username, err := tokenFromCtx(ctx, tokens)
+	if err != nil {
+		return err
+	}
+	pt := authpb.READ
+	if write {
+		pt = authpb.WRITE
+	}
+	key := DocumentPermissionKey(collection)
+	if err := store.CheckPermission(username, key, pt); err != nil {
+		return status.Errorf(codes.PermissionDenied, "permission denied on collection %q", collection)
+	}
+	return nil
+}
+
+// DocumentPermissionKey returns the virtual RBAC key for a document collection.
+func DocumentPermissionKey(collection string) string {
+	return "/doc/" + collection + "/"
 }
 
 // checkAuthKeyAccess returns PermissionDenied if req contains a key in the

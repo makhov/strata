@@ -23,6 +23,7 @@ import (
 	"github.com/t4db/t4/etcd/auth"
 	"github.com/t4db/t4/internal/metrics"
 	"github.com/t4db/t4/pkg/object"
+	"github.com/t4db/t4/t4doc"
 )
 
 func runCmd() *cobra.Command {
@@ -227,6 +228,15 @@ func runCmd() *cobra.Command {
 
 			srv := grpc.NewServer(grpcOpts...)
 			t4etcd.New(node, authStore, tokens).Register(srv)
+			docDB := t4doc.Open(node)
+			defer docDB.Close()
+			var docOpts []t4doc.ServerOption
+			if authStore != nil {
+				docOpts = append(docOpts, t4doc.WithAuthorizer(func(ctx context.Context, collection string, write bool) error {
+					return auth.CheckDocumentPermission(ctx, authStore, tokens, collection, write)
+				}))
+			}
+			t4doc.NewServer(docDB, docOpts...).Register(srv)
 
 			go func() {
 				if err := srv.Serve(lis); err != nil {

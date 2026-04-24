@@ -567,6 +567,72 @@ func (s *Store) List(prefix string) ([]*KeyValue, error) {
 	return out, iter.Error()
 }
 
+// Scan returns a page of live keys matching opts and the cursor for the last
+// returned key. The returned cursor is empty when no key was returned.
+func (s *Store) Scan(opts ScanOptions) ([]*KeyValue, string, error) {
+	lower, upper, err := scanBounds(opts)
+	if err != nil {
+		return nil, "", err
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("store: scan iter: %w", err)
+	}
+	defer iter.Close()
+
+	var out []*KeyValue
+	var cursor string
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := string(iter.Key()[1:]) // strip 'i' prefix
+		if opts.After != "" && k <= opts.After {
+			continue
+		}
+		rev := decodeRev(iter.Value())
+		kv, err := s.getLogEntry(k, rev)
+		if err != nil {
+			return nil, "", err
+		}
+		out = append(out, kv)
+		cursor = k
+		if opts.Limit > 0 && len(out) >= opts.Limit {
+			break
+		}
+	}
+	return out, cursor, iter.Error()
+}
+
+// ScanOptions configures Store.Scan. It mirrors t4.ScanOptions without
+// importing the public package into internal/store.
+type ScanOptions struct {
+	Prefix string
+	Start  string
+	End    string
+	After  string
+	Limit  int
+}
+
+func scanBounds(opts ScanOptions) ([]byte, []byte, error) {
+	if opts.Prefix != "" && (opts.Start != "" || opts.End != "") {
+		return nil, nil, fmt.Errorf("store: scan prefix is mutually exclusive with start/end")
+	}
+	if opts.Prefix != "" {
+		return idxKey(opts.Prefix), idxKeyUpper(opts.Prefix), nil
+	}
+	if opts.End != "" && opts.Start > opts.End {
+		return nil, nil, fmt.Errorf("store: scan start must be <= end")
+	}
+	lower := idxKey(opts.Start)
+	upper := idxUpper
+	if opts.End != "" {
+		upper = idxKey(opts.End)
+	}
+	return lower, upper, nil
+}
+
 // Count returns the number of live keys with the given prefix.
 func (s *Store) Count(prefix string) (int64, error) {
 	lower := idxKey(prefix)

@@ -768,6 +768,14 @@ func (n *Node) LinearizableCount(ctx context.Context, prefix string) (int64, err
 	return n.Count(prefix)
 }
 
+// LinearizableScan returns a scan page with linearizability guaranteed.
+func (n *Node) LinearizableScan(ctx context.Context, opts ScanOptions) ([]*KeyValue, string, error) {
+	if err := n.syncWithLeader(ctx); err != nil {
+		return nil, "", err
+	}
+	return n.Scan(ctx, opts)
+}
+
 func (n *Node) Get(key string) (*KeyValue, error) {
 	if n.closed.Load() {
 		return nil, ErrClosed
@@ -802,6 +810,39 @@ func (n *Node) List(prefix string) ([]*KeyValue, error) {
 		out[i] = toKV(sv)
 	}
 	return out, nil
+}
+
+// Scan returns one page of live keys and a cursor for continuing the scan.
+func (n *Node) Scan(ctx context.Context, opts ScanOptions) ([]*KeyValue, string, error) {
+	if n.closed.Load() {
+		return nil, "", ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	n.readMu.RLock()
+	defer n.readMu.RUnlock()
+	if n.closed.Load() {
+		return nil, "", ErrClosed
+	}
+	svs, cursor, err := n.db.Load().Scan(istore.ScanOptions{
+		Prefix: opts.Prefix,
+		Start:  opts.Start,
+		End:    opts.End,
+		After:  opts.After,
+		Limit:  opts.Limit,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	out := make([]*KeyValue, len(svs))
+	for i, sv := range svs {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		out[i] = toKV(sv)
+	}
+	return out, cursor, nil
 }
 
 func (n *Node) Count(prefix string) (int64, error) { return n.db.Load().Count(prefix) }
