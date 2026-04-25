@@ -442,8 +442,14 @@ func (s *Store) waitChan() <-chan struct{} {
 // WaitForRevision blocks until currentRev >= rev, ctx is cancelled, or the
 // store is closed.
 func (s *Store) WaitForRevision(ctx context.Context, rev int64) error {
-	for atomic.LoadInt64(&s.currentRev) < rev {
+	for {
+		// Snapshot the notify channel before re-checking currentRev. If a
+		// broadcast races between the load and the select, ch is already
+		// closed and the select returns immediately — no lost wakeup.
 		ch := s.waitChan()
+		if atomic.LoadInt64(&s.currentRev) >= rev {
+			return nil
+		}
 		select {
 		case <-ch:
 		case <-s.closed:
@@ -452,7 +458,6 @@ func (s *Store) WaitForRevision(ctx context.Context, rev int64) error {
 			return ctx.Err()
 		}
 	}
-	return nil
 }
 
 // --- Read path ---

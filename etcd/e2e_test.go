@@ -147,7 +147,7 @@ func basicCRUD(t *testing.T, cli *clientv3.Client) {
 	// Watch.
 	watchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	wch := cli.Watch(watchCtx, "/smoke/watch/")
+	wch := cli.Watch(watchCtx, "/smoke/watch/", clientv3.WithPrefix())
 	go func() { cli.Put(watchCtx, "/smoke/watch/key", "event") }()
 	select {
 	case wr := <-wch:

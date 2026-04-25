@@ -120,6 +120,123 @@ func TestWatchNonMatchingPrefix(t *testing.T) {
 	}
 }
 
+func TestWatchExactKeyDoesNotActLikePrefix(t *testing.T) {
+	node, cli := newWatchNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wch := cli.Watch(ctx, "/exact/key")
+	if _, err := node.Put(ctx, "/exact/key-child", []byte("wrong"), 0); err != nil {
+		t.Fatalf("Put child: %v", err)
+	}
+	if _, err := node.Put(ctx, "/exact/key", []byte("right"), 0); err != nil {
+		t.Fatalf("Put exact: %v", err)
+	}
+
+	for {
+		select {
+		case wr := <-wch:
+			if err := wr.Err(); err != nil {
+				t.Fatalf("watch error: %v", err)
+			}
+			for _, ev := range wr.Events {
+				if string(ev.Kv.Key) == "/exact/key-child" {
+					t.Fatal("exact watch received prefix child event")
+				}
+				if string(ev.Kv.Key) == "/exact/key" {
+					return
+				}
+			}
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for exact watch event")
+		}
+	}
+}
+
+func TestWatchRangeEndFiltersInterval(t *testing.T) {
+	node, cli := newWatchNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wch := cli.Watch(ctx, "/range/b", clientv3.WithRange("/range/d"))
+	for _, key := range []string{"/range/a", "/range/b", "/range/c", "/range/d"} {
+		if _, err := node.Put(ctx, key, []byte("v"), 0); err != nil {
+			t.Fatalf("Put(%q): %v", key, err)
+		}
+	}
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case wr := <-wch:
+			if err := wr.Err(); err != nil {
+				t.Fatalf("watch error: %v", err)
+			}
+			for _, ev := range wr.Events {
+				key := string(ev.Kv.Key)
+				if key == "/range/a" || key == "/range/d" {
+					t.Fatalf("range watch received out-of-range key %q", key)
+				}
+				seen[key] = true
+			}
+		case <-ctx.Done():
+			t.Fatalf("timeout waiting for range watch events, seen=%v", seen)
+		}
+	}
+	if !seen["/range/b"] || !seen["/range/c"] {
+		t.Fatalf("range watch missed expected keys: %v", seen)
+	}
+}
+
+func TestWatchProgressNotify(t *testing.T) {
+	_, cli := newWatchNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wch := cli.Watch(ctx, "/progress/key", clientv3.WithProgressNotify())
+	for {
+		select {
+		case wr := <-wch:
+			if err := wr.Err(); err != nil {
+				t.Fatalf("watch error: %v", err)
+			}
+			if wr.IsProgressNotify() {
+				if wr.Header.GetRevision() == 0 {
+					t.Fatal("progress notify returned revision 0")
+				}
+				return
+			}
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for progress notification")
+		}
+	}
+}
+
+func TestWatchRequestProgress(t *testing.T) {
+	_, cli := newWatchNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wch := cli.Watch(ctx, "/progress/request")
+	if err := cli.RequestProgress(ctx); err != nil {
+		t.Fatalf("RequestProgress: %v", err)
+	}
+
+	for {
+		select {
+		case wr := <-wch:
+			if err := wr.Err(); err != nil {
+				t.Fatalf("watch error: %v", err)
+			}
+			if wr.IsProgressNotify() {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for requested progress notification")
+		}
+	}
+}
+
 // TestWatchMultipleConcurrent verifies multiple simultaneous watches each
 // receive only their own events.
 func TestWatchMultipleConcurrent(t *testing.T) {
