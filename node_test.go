@@ -281,7 +281,7 @@ func TestNodeWatch(t *testing.T) {
 	n := openNode(t)
 	c := ctx(t)
 
-	ch, err := n.Watch(c, "/w/", 0, false)
+	ch, err := n.Watch(c, "/w/", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestNodeWatchPrevKV(t *testing.T) {
 	c := ctx(t)
 	n.Put(c, "k", []byte("old"), 0)
 
-	ch, _ := n.Watch(c, "k", n.CurrentRevision()+1, true)
+	ch, _ := n.Watch(c, "k", n.CurrentRevision()+1, t4.WithPrevKV())
 
 	go func() { n.Put(c, "k", []byte("new"), 0) }()
 
@@ -365,19 +365,19 @@ func TestWatchCompactedRevisionReturnsError(t *testing.T) {
 	}
 
 	// startRev=1 is inside the compacted range → ErrCompacted.
-	_, err := n.Watch(c, "k", 1, false)
+	_, err := n.Watch(c, "k", 1)
 	if !errors.Is(err, t4.ErrCompacted) {
 		t.Errorf("Watch from deeply compacted rev: want ErrCompacted, got %v", err)
 	}
 
 	// startRev=3 is the compact boundary itself; etcd semantics require ErrCompacted.
-	_, err = n.Watch(c, "k", 3, false)
+	_, err = n.Watch(c, "k", 3)
 	if !errors.Is(err, t4.ErrCompacted) {
 		t.Errorf("Watch from compact watermark (startRev=compactRev): want ErrCompacted, got %v", err)
 	}
 
 	// startRev=4 (above compact boundary) is always fine.
-	ch, err := n.Watch(c, "k", 4, false)
+	ch, err := n.Watch(c, "k", 4)
 	if err != nil {
 		t.Errorf("Watch above compact boundary: unexpected error %v", err)
 	} else {
@@ -644,7 +644,7 @@ func TestTxnWatchEvents(t *testing.T) {
 	n := openNode(t)
 	c := ctx(t)
 
-	ch, err := n.Watch(c, "", 0, false) // watch all keys
+	ch, err := n.Watch(c, "", 0) // watch all keys
 	if err != nil {
 		t.Fatal(err)
 	}

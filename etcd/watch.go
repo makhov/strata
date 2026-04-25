@@ -95,7 +95,11 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 
 			go func(watchID int64, startRev int64) {
 				scanPrefix, match := watchScan(cr)
-				events, err := s.node.Watch(wctx, scanPrefix, fromEtcdRevision(startRev), cr.PrevKv)
+				var watchOpts []t4.WatchOption
+				if cr.PrevKv {
+					watchOpts = append(watchOpts, t4.WithPrevKV())
+				}
+				events, err := s.node.Watch(wctx, scanPrefix, fromEtcdRevision(startRev), watchOpts...)
 				if errors.Is(err, t4.ErrCompacted) {
 					// Remove the watch first, but do not cancel wctx before sending
 					// the compacted response: that races the select below and can

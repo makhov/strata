@@ -846,11 +846,27 @@ func (n *Node) Flush() error {
 	return n.db.Load().Flush()
 }
 
+// WatchOption configures a Watch call. Use the With* helpers.
+type WatchOption func(*watchOpts)
+
+type watchOpts struct {
+	prevKV bool
+}
+
+// WithPrevKV requests that emitted events include the previous KV for updates
+// and deletes. Off by default: populating PrevKV adds one Pebble lookup per
+// non-create event, which is significant under high churn.
+func WithPrevKV() WatchOption {
+	return func(o *watchOpts) { o.prevKV = true }
+}
+
 // Watch streams prefix-matching events using etcd revision semantics:
 // startRev=0 means "from now"; startRev=N means replay from revision N (inclusive).
-// When withPrevKV is false, emitted events have PrevKV == nil; this skips one
-// Pebble lookup per non-create event and is meaningful under high churn.
-func (n *Node) Watch(ctx context.Context, prefix string, startRev int64, withPrevKV bool) (<-chan Event, error) {
+func (n *Node) Watch(ctx context.Context, prefix string, startRev int64, opts ...WatchOption) (<-chan Event, error) {
+	var o watchOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
 	if startRev > 0 && startRev <= n.db.Load().CompactRevision() {
 		return nil, ErrCompacted
 	}
@@ -860,7 +876,7 @@ func (n *Node) Watch(ctx context.Context, prefix string, startRev int64, withPre
 	if startRev == 0 {
 		storeStartRev = n.db.Load().CurrentRevision()
 	}
-	sch, err := n.db.Load().Watch(ctx, prefix, storeStartRev, withPrevKV)
+	sch, err := n.db.Load().Watch(ctx, prefix, storeStartRev, o.prevKV)
 	if err != nil {
 		return nil, err
 	}
