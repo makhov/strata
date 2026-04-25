@@ -395,3 +395,42 @@ func TestWaitForRevision(t *testing.T) {
 		t.Error("timeout")
 	}
 }
+
+// TestWaitForRevisionConcurrent stresses many waiters racing against an Apply
+// that satisfies their target revision. With the lost-wakeup bug, a waiter
+// could read the new notify channel after broadcast already fired and block
+// indefinitely on it. The race window is narrow so this test is probabilistic;
+// it serves as a smoke check that the wait path stays sane under contention.
+func TestWaitForRevisionConcurrent(t *testing.T) {
+	const iters = 500
+	const waiters = 32
+
+	for i := 0; i < iters; i++ {
+		s := openMem(t)
+		targetRev := int64(1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+		errs := make(chan error, waiters)
+		for w := 0; w < waiters; w++ {
+			go func() { errs <- s.WaitForRevision(ctx, targetRev) }()
+		}
+
+		apply(t, s, createEntry(targetRev, "k", nil))
+
+		for w := 0; w < waiters; w++ {
+			select {
+			case err := <-errs:
+				if err != nil {
+					cancel()
+					t.Fatalf("iter %d waiter %d: %v", i, w, err)
+				}
+			case <-ctx.Done():
+				cancel()
+				t.Fatalf("iter %d: lost wakeup — %d/%d waiters returned",
+					i, w, waiters)
+			}
+		}
+		cancel()
+	}
+}
