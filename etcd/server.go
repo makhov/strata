@@ -33,6 +33,7 @@ const (
 	defaultMaxRequestBytes      = int(1.5 * 1024 * 1024)
 	grpcOverheadBytes           = 512 * 1024
 	maxSendBytes                = math.MaxInt32
+	emulatedETCDVersion         = "3.5.13"
 )
 
 // Server implements the etcd v3 gRPC protocol on top of a t4 Node.
@@ -309,7 +310,7 @@ func (s *Server) Status(_ context.Context, _ *etcdserverpb.StatusRequest) (*etcd
 	etcdRev := toEtcdRevision(rev)
 	return &etcdserverpb.StatusResponse{
 		Header:           s.header(),
-		Version:          "t4",
+		Version:          emulatedETCDVersion,
 		Leader:           leader,
 		RaftIndex:        uint64(etcdRev),
 		RaftAppliedIndex: uint64(etcdRev),
