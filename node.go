@@ -622,6 +622,62 @@ func (n *Node) electAndStart(bgCtx context.Context) error {
 	return nil
 }
 
+// gracefulLeaderShutdown drains in-flight writes, uploads the WAL synchronously
+// to object storage, and updates the election lock's CommittedRev so a future
+// TakeOver cannot win at a revision below what we acknowledged to clients.
+// Only after all of that completes does it broadcast shutdown to followers.
+//
+// Acquires n.fenceMu.Lock() to drain in-flight writes. Releases it before
+// returning so that the subsequent n.cancelBg() can drive checkpointLoop /
+// watchLoop to exit cleanly — those loops also acquire fenceMu, and would
+// deadlock waiting for it if we held it indefinitely. After this function
+// returns, n.closed is true so no new writes will start.
+//
+// Must be invoked BEFORE n.cancelBg(): commitLoop has to be alive to drain
+// the in-flight batch and signal each Put's done channel.
+//
+// Best-effort: errors are logged, not propagated. The leader is going down
+// regardless; the goal is to maximise durability before that happens.
+func (n *Node) gracefulLeaderShutdown(peerSrv *peer.Server) {
+	// 1. Fence in-flight writes. Put holds fenceMu.RLock for its entire
+	//    duration (writes.go), so this Lock waits until commitLoop has
+	//    signalled done for every batch already in writeC. New Puts are
+	//    rejected by the n.closed.Load() check at the top of Put because
+	//    closeOnce already set n.closed before calling us.
+	n.fenceMu.Lock()
+	defer n.fenceMu.Unlock()
+
+	// 2. Seal and synchronously upload all WAL segments to S3, including
+	//    the active segment containing our most recent acks. wal.Close
+	//    drains the upload queue and uploads the final segment using a
+	//    fresh 2-minute context so a cancelled bgCtx cannot cut it short.
+	if werr := n.wal.Close(); werr != nil {
+		n.log.Errorf("t4: graceful shutdown: wal close: %v", werr)
+	}
+
+	// 3. Touch the election lock with our true CurrentRevision so that
+	//    election.TakeOver fences any candidate whose local revision is
+	//    behind us. Without this the lock's CommittedRev reflects only
+	//    the last periodic touch, which can lag the actual durable rev
+	//    by an entire LeaderWatchInterval.
+	if n.cfg.ObjectStore != nil {
+		tCtx, tCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		lock := election.NewLock(n.cfg.ObjectStore, n.cfg.NodeID, n.cfg.AdvertisePeerAddr)
+		if terr := lock.Touch(tCtx, n.term, n.cfg.AdvertisePeerAddr, n.db.Load().CurrentRevision()); terr != nil {
+			n.log.Warnf("t4: graceful shutdown: lock touch: %v", terr)
+		}
+		tCancel()
+	}
+
+	// 4. Now safe for followers to take over: WAL is durable in S3 and
+	//    the lock fences anyone behind us. BroadcastShutdown closes the
+	//    streams' shutdown channel; each Follow loop sends a Shutdown
+	//    msg and returns, then the follower runs attemptPromotion.
+	if peerSrv != nil {
+		peerSrv.BroadcastShutdown()
+	}
+}
+
 // Close shuts down the node cleanly.
 func (n *Node) Close() error {
 	var err error
@@ -643,8 +699,21 @@ func (n *Node) Close() error {
 		// Follower: tell the leader this disconnect is intentional so it skips
 		// split-brain fencing machinery.
 		//
-		// Leader: tell all followers to start election immediately so they don't
-		// wait FollowerMaxRetries × FollowerRetryInterval before taking over.
+		// Leader: drain in-flight writes, upload the WAL to S3, and stamp the
+		// election lock with our final committed revision BEFORE telling
+		// followers to take over. The order matters:
+		//
+		//   1. Without a fence-and-flush, a follower can win TakeOver while
+		//      our last sealed segment is still uploading. The new leader
+		//      starts writing term=N+1 at the same revision range our
+		//      term=N segment will eventually occupy in S3, and walTermCutoffs
+		//      drops our entries on every future replay → permanent data loss.
+		//
+		//   2. Without a fresh lock.CommittedRev, a TakeOver candidate can
+		//      win election with a local revision below entries we already
+		//      acknowledged to clients. Touching the lock here turns those
+		//      entries into a fence (election.TakeOver backs off candidates
+		//      whose committedRev is below the lock's value).
 		switch role {
 		case roleFollower:
 			if peerCli != nil {
@@ -653,9 +722,7 @@ func (n *Node) Close() error {
 				gCancel()
 			}
 		case roleLeader:
-			if peerSrv != nil {
-				peerSrv.BroadcastShutdown()
-			}
+			n.gracefulLeaderShutdown(peerSrv)
 		}
 
 		n.cancelBg()

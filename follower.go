@@ -176,16 +176,39 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, grac
 	// Revision fence: refuse to become leader if we are behind the last known
 	// committed revision. A node missing entries would either drop them (data
 	// loss) or fail to serve reads that clients already observed.
-	// If the lock already points to a current leader, return their address so
-	// followLoop switches to following them — connecting will trigger an
-	// in-place resync that catches up this node's revision.
 	if existing != nil && existing.CommittedRev > n.db.Load().CurrentRevision() {
-		n.log.Infof("t4: takeover: node is behind leader committed rev (ours=%d, leader=%d) — following current leader to catch up",
-			n.db.Load().CurrentRevision(), existing.CommittedRev)
-		if existing.LeaderAddr != "" {
-			return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log), false
+		// Graceful shutdown path: the old leader vacated and (under the new
+		// graceful-leader-shutdown protocol) uploaded its WAL to S3 before
+		// touching the lock with its final CommittedRev. Following the
+		// existing.LeaderAddr would just retry a dead endpoint forever —
+		// catch up via S3 instead, then proceed to TakeOver.
+		if graceful && n.cfg.ObjectStore != nil {
+			n.log.Infof("t4: takeover: catching up from S3 before takeover (ours=%d, leader=%d)",
+				n.db.Load().CurrentRevision(), existing.CommittedRev)
+			catchupCtx, catchupCancel := context.WithTimeout(bgCtx, 2*time.Minute)
+			rerr := replayRemote(catchupCtx, n.db.Load(), n.cfg.ObjectStore, n.db.Load().CurrentRevision(), n.log)
+			catchupCancel()
+			if rerr != nil {
+				n.log.Errorf("t4: takeover catch-up replay: %v — will retry", rerr)
+				return nil, false
+			}
+			if existing.CommittedRev > n.db.Load().CurrentRevision() {
+				n.log.Warnf("t4: takeover: still behind after S3 catch-up (ours=%d, leader=%d) — will retry once WAL upload completes",
+					n.db.Load().CurrentRevision(), existing.CommittedRev)
+				return nil, false
+			}
+			// Fall through to TakeOver with caught-up state.
+		} else {
+			// Non-graceful: a current leader may still be alive somewhere with
+			// fresh writes. Switch followLoop to its address so connecting
+			// triggers an in-place resync that catches up this node.
+			n.log.Infof("t4: takebover: node is behind leader committed rev (ours=%d, leader=%d) — following current leader to catch up",
+				n.db.Load().CurrentRevision(), existing.CommittedRev)
+			if existing.LeaderAddr != "" {
+				return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log), false
+			}
+			return nil, false
 		}
-		return nil, false
 	}
 
 	rec, won, err := lock.TakeOver(ctx, n.term, n.db.Load().CurrentRevision())
