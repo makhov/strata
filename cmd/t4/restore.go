@@ -38,12 +38,13 @@ func restoreListCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("list checkpoints: %w", err)
 			}
+			out := cmd.OutOrStdout()
 			if len(keys) == 0 {
-				fmt.Println("No checkpoints found.")
+				fmt.Fprintln(out, "No checkpoints found.")
 				return nil
 			}
 			manifest, _ := cp.ReadManifest(ctx, store)
-			fmt.Printf("%-72s  %10s  %6s\n", "CHECKPOINT", "REVISION", "TERM")
+			fmt.Fprintf(out, "%-72s  %10s  %6s\n", "CHECKPOINT", "REVISION", "TERM")
 			for _, key := range keys {
 				idx, err := cp.ReadCheckpointIndex(ctx, store, key)
 				suffix := ""
@@ -51,9 +52,9 @@ func restoreListCmd() *cobra.Command {
 					suffix = "  (latest)"
 				}
 				if err != nil {
-					fmt.Printf("%-72s  %10s  %6s%s\n", key, "?", "?", suffix)
+					fmt.Fprintf(out, "%-72s  %10s  %6s%s\n", key, "?", "?", suffix)
 				} else {
-					fmt.Printf("%-72s  %10d  %6d%s\n", key, idx.Revision, idx.Term, suffix)
+					fmt.Fprintf(out, "%-72s  %10d  %6d%s\n", key, idx.Revision, idx.Term, suffix)
 				}
 			}
 			return nil
@@ -118,13 +119,14 @@ replaying newer WAL from S3, omit --s3-bucket entirely.`,
 				return fmt.Errorf("restore checkpoint: %w", err)
 			}
 
-			fmt.Printf("Restored checkpoint\n")
-			fmt.Printf("  key:       %s\n", key)
-			fmt.Printf("  revision:  %d\n", rev)
-			fmt.Printf("  term:      %d\n", term)
-			fmt.Printf("  data-dir:  %s\n", dataDir)
-			fmt.Printf("\nStart the restored node:\n")
-			fmt.Printf("  t4 run --data-dir %s [--s3-bucket <new-bucket>] --listen 0.0.0.0:3379\n", dataDir)
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "Restored checkpoint\n")
+			fmt.Fprintf(out, "  key:       %s\n", key)
+			fmt.Fprintf(out, "  revision:  %d\n", rev)
+			fmt.Fprintf(out, "  term:      %d\n", term)
+			fmt.Fprintf(out, "  data-dir:  %s\n", dataDir)
+			fmt.Fprintf(out, "\nStart the restored node:\n")
+			fmt.Fprintf(out, "  t4 run --data-dir %s [--s3-bucket <new-bucket>] --listen 0.0.0.0:3379\n", dataDir)
 			return nil
 		},
 	}
