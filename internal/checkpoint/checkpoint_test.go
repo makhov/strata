@@ -132,6 +132,24 @@ func TestWriteReadManifest(t *testing.T) {
 	}
 }
 
+func TestReadManifestRejectsFutureFormatVersion(t *testing.T) {
+	store := object.NewMem()
+	ctx := context.Background()
+
+	body := `{"format_version":999,"checkpoint_key":"checkpoint/0000000001/00000000000000000042/manifest.json","revision":42,"term":1}`
+	if err := store.Put(ctx, checkpoint.ManifestKey, strings.NewReader(body)); err != nil {
+		t.Fatalf("Put manifest: %v", err)
+	}
+
+	_, err := testCP.ReadManifest(ctx, store)
+	if err == nil {
+		t.Fatal("ReadManifest: expected future format error, got nil")
+	}
+	if !strings.Contains(err.Error(), "format_version=999") {
+		t.Fatalf("ReadManifest error should mention future format version, got %v", err)
+	}
+}
+
 func TestWriteManifestOverwrite(t *testing.T) {
 	store := object.NewMem()
 	ctx := context.Background()
@@ -359,6 +377,25 @@ func TestRestoreNotFound(t *testing.T) {
 	_, _, err := testCP.Restore(context.Background(), store, "checkpoint/missing", t.TempDir())
 	if err == nil {
 		t.Error("expected error restoring non-existent checkpoint")
+	}
+}
+
+func TestReadCheckpointIndexRejectsFutureFormatVersion(t *testing.T) {
+	store := object.NewMem()
+	ctx := context.Background()
+	key := checkpoint.CheckpointIndexKey(1, 42)
+
+	body := `{"format_version":999,"term":1,"revision":42,"sst_files":[],"pebble_meta":[]}`
+	if err := store.Put(ctx, key, strings.NewReader(body)); err != nil {
+		t.Fatalf("Put checkpoint index: %v", err)
+	}
+
+	_, err := testCP.ReadCheckpointIndex(ctx, store, key)
+	if err == nil {
+		t.Fatal("ReadCheckpointIndex: expected future format error, got nil")
+	}
+	if !strings.Contains(err.Error(), "format_version=999") {
+		t.Fatalf("ReadCheckpointIndex error should mention future format version, got %v", err)
 	}
 }
 
