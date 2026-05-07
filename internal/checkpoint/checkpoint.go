@@ -149,7 +149,9 @@ func (m *Manager) ReadManifest(ctx context.Context, store object.Store) (*Manife
 	// FormatVersion == 0 means the manifest was written by an older node that
 	// did not emit the field (backward-compatible: treat as version 1).
 	if manifest.FormatVersion > CheckpointFormatVersion {
-		m.log.Warnf("checkpoint: manifest format_version=%d > known=%d — this node may be too old; upgrade recommended",
+		m.log.Warnf("checkpoint: manifest format_version=%d > known=%d - this node is too old; upgrade required",
+			manifest.FormatVersion, CheckpointFormatVersion)
+		return nil, fmt.Errorf("checkpoint: manifest format_version=%d is newer than supported format_version=%d",
 			manifest.FormatVersion, CheckpointFormatVersion)
 	}
 	return &manifest, nil
@@ -504,7 +506,9 @@ func (mgr *Manager) ReadCheckpointIndex(ctx context.Context, store object.Store,
 		return nil, fmt.Errorf("decode checkpoint index %q: %w", key, decErr)
 	}
 	if idx.FormatVersion > CheckpointFormatVersion {
-		mgr.log.Warnf("checkpoint: index %q format_version=%d > known=%d — this node may be too old; upgrade recommended",
+		mgr.log.Warnf("checkpoint: index %q format_version=%d > known=%d - this node is too old; upgrade required",
+			key, idx.FormatVersion, CheckpointFormatVersion)
+		return nil, fmt.Errorf("checkpoint: index %q format_version=%d is newer than supported format_version=%d",
 			key, idx.FormatVersion, CheckpointFormatVersion)
 	}
 	return &idx, nil
