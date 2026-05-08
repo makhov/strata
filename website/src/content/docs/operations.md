@@ -93,6 +93,44 @@ polling — the only S3 election writes are at startup, on leader takeover, and 
 are disconnected. In cluster mode, writes additionally require quorum ACK from all connected followers before returning
 to the caller.
 
+### S3 operation budget
+
+The default settings are useful for estimating monthly S3 request volume:
+
+| Setting | Default | Monthly count over 30 days |
+|---------|---------|----------------------------|
+| Month length | 30 days | 2,592,000 seconds |
+| `SegmentMaxAge` | 10 s | Up to 259,200 age-based WAL rotations/uploads with continuous writes |
+| `SegmentMaxSize` | 50 MB | Adds more WAL uploads if the workload writes 50 MB before 10 s elapses |
+| `CheckpointInterval` | 15 min | 2,880 checkpoint cycles |
+| `LeaderWatchInterval` | 5 min | 8,640 periodic leader lock reads |
+| `FollowerRetryInterval` | 2 s | 1,296,000 liveness poll ticks if a follower is disconnected all month |
+
+In a healthy cluster, ordinary writes do not wait for S3. The steady-state S3 cost is mostly asynchronous WAL upload:
+
+| Source | Approximate monthly S3 operations |
+|--------|-----------------------------------|
+| WAL archive | ~259,200 PUTs for continuous low/medium write traffic, plus size-based rotations if WAL reaches 50 MB before 10 s |
+| Periodic leader lock watch | ~8,640 GETs |
+| Checkpoints | 2,880 checkpoint cycles; each writes several small objects plus any new SST files for changed data |
+
+Follower disconnects add incident traffic, not baseline traffic. While a follower is disconnected, the leader performs a
+fenced liveness check/touch every 2 seconds: one GET plus one conditional PUT per tick. A month-long disconnect would be
+about 1,296,000 GETs and 1,296,000 PUTs.
+
+Single-node synchronous S3 durability has a different cost profile. With `WALSyncUpload=true`, each acknowledged
+`AppendBatch` is uploaded before returning, so the cost is close to one WAL PUT per write batch:
+
+| Write rate, no meaningful batching | Approximate WAL PUTs/month |
+|------------------------------------|----------------------------|
+| 1 write/s | 2,592,000 |
+| 10 writes/s | 25,920,000 |
+| 100 writes/s | 259,200,000 |
+
+If the local disk is durable and you can accept an upload window, `WALSyncUpload=false` moves single-node uploads to the
+segment rotation cadence: roughly the same ~259,200 WAL PUTs/month for continuous low/medium writes, plus extra PUTs
+when size-based rotation triggers sooner than 10 seconds.
+
 ### Adding a node to a running cluster
 
 Start a new node with a fresh `--data-dir` and the same S3 bucket. It will:
