@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bytes"
@@ -14,7 +14,7 @@ func TestInspectMeta(t *testing.T) {
 	dataDir := seedInspectDB(t)
 
 	stdout := &bytes.Buffer{}
-	cmd := rootCmd()
+	cmd := NewRootCmd()
 	cmd.SetOut(stdout)
 	cmd.SetErr(stdout)
 	cmd.SetArgs([]string{"inspect", "meta", "--data-dir", dataDir})
@@ -36,7 +36,7 @@ func TestInspectGetJSON(t *testing.T) {
 	dataDir := seedInspectDB(t)
 
 	stdout := &bytes.Buffer{}
-	cmd := rootCmd()
+	cmd := NewRootCmd()
 	cmd.SetOut(stdout)
 	cmd.SetErr(stdout)
 	cmd.SetArgs([]string{"inspect", "get", "--data-dir", dataDir, "--json", "/alpha"})
@@ -62,7 +62,7 @@ func TestInspectListAndCount(t *testing.T) {
 	dataDir := seedInspectDB(t)
 
 	listOut := &bytes.Buffer{}
-	listCmd := rootCmd()
+	listCmd := NewRootCmd()
 	listCmd.SetOut(listOut)
 	listCmd.SetErr(listOut)
 	listCmd.SetArgs([]string{"inspect", "list", "--data-dir", dataDir, "--prefix", "/a"})
@@ -77,7 +77,7 @@ func TestInspectListAndCount(t *testing.T) {
 	}
 
 	countOut := &bytes.Buffer{}
-	countCmd := rootCmd()
+	countCmd := NewRootCmd()
 	countCmd.SetOut(countOut)
 	countCmd.SetErr(countOut)
 	countCmd.SetArgs([]string{"inspect", "count", "--data-dir", dataDir, "--prefix", "/"})
@@ -93,7 +93,7 @@ func TestInspectListPositionalPrefix(t *testing.T) {
 	dataDir := seedPathInspectDB(t)
 
 	stdout := &bytes.Buffer{}
-	cmd := rootCmd()
+	cmd := NewRootCmd()
 	cmd.SetOut(stdout)
 	cmd.SetErr(stdout)
 	cmd.SetArgs([]string{"inspect", "list", "--data-dir", dataDir, "/foo"})
@@ -114,7 +114,7 @@ func TestInspectListRejectsPositionalPrefixAndFlag(t *testing.T) {
 	dataDir := seedPathInspectDB(t)
 
 	stdout := &bytes.Buffer{}
-	cmd := rootCmd()
+	cmd := NewRootCmd()
 	cmd.SetOut(stdout)
 	cmd.SetErr(stdout)
 	cmd.SetArgs([]string{"inspect", "list", "--data-dir", dataDir, "--prefix", "/foo", "/bar"})
@@ -131,7 +131,7 @@ func TestInspectHistory(t *testing.T) {
 	dataDir := seedInspectDB(t)
 
 	stdout := &bytes.Buffer{}
-	cmd := rootCmd()
+	cmd := NewRootCmd()
 	cmd.SetOut(stdout)
 	cmd.SetErr(stdout)
 	cmd.SetArgs([]string{"inspect", "history", "--data-dir", dataDir, "/beta"})
@@ -155,7 +155,7 @@ func TestInspectDiffJSON(t *testing.T) {
 	dataDir := seedInspectDB(t)
 
 	stdout := &bytes.Buffer{}
-	cmd := rootCmd()
+	cmd := NewRootCmd()
 	cmd.SetOut(stdout)
 	cmd.SetErr(stdout)
 	cmd.SetArgs([]string{"inspect", "diff", "--data-dir", dataDir, "--from-rev", "2", "--to-rev", "4", "--json"})

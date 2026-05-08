@@ -118,43 +118,103 @@ export T4_NODE_ID=node-a
 t4 run --listen 0.0.0.0:3379
 ```
 
-#### `t4 run`
+#### CLI environment variables
 
-| Environment variable           | Equivalent flag               |
-|--------------------------------|-------------------------------|
-| `T4_DATA_DIR`                  | `--data-dir`                  |
-| `T4_LISTEN`                    | `--listen`                    |
-| `T4_S3_BUCKET`                 | `--s3-bucket`                 |
-| `T4_S3_PREFIX`                 | `--s3-prefix`                 |
-| `T4_S3_ENDPOINT`               | `--s3-endpoint`               |
-| `T4_S3_REGION`                 | `--s3-region`                 |
-| `T4_S3_PROFILE`                | `--s3-profile`                |
-| `T4_S3_ACCESS_KEY_ID`          | `--s3-access-key-id`          |
-| `T4_S3_SECRET_ACCESS_KEY`      | `--s3-secret-access-key`      |
-| `T4_SEGMENT_MAX_SIZE_MB`       | `--segment-max-size-mb`       |
-| `T4_SEGMENT_MAX_AGE_SEC`       | `--segment-max-age-sec`       |
-| `T4_WAL_SYNC_UPLOAD`           | `--wal-sync-upload`           |
-| `T4_CHECKPOINT_INTERVAL_MIN`   | `--checkpoint-interval-min`   |
-| `T4_CHECKPOINT_ENTRIES`        | `--checkpoint-entries`        |
-| `T4_READ_CONSISTENCY`          | `--read-consistency`          |
-| `T4_LOG_LEVEL`                 | `--log-level`                 |
-| `T4_NODE_ID`                   | `--node-id`                   |
-| `T4_PEER_LISTEN`               | `--peer-listen`               |
-| `T4_ADVERTISE_PEER`            | `--advertise-peer`            |
-| `T4_LEADER_WATCH_INTERVAL_SEC` | `--leader-watch-interval-sec` |
-| `T4_FOLLOWER_MAX_RETRIES`      | `--follower-max-retries`      |
-| `T4_FOLLOWER_WAIT_MODE`        | `--follower-wait-mode`        |
-| `T4_PEER_TLS_CA`               | `--peer-tls-ca`               |
-| `T4_PEER_TLS_CERT`             | `--peer-tls-cert`             |
-| `T4_PEER_TLS_KEY`              | `--peer-tls-key`              |
-| `T4_CLIENT_TLS_CERT`           | `--client-tls-cert`           |
-| `T4_CLIENT_TLS_KEY`            | `--client-tls-key`            |
-| `T4_CLIENT_TLS_CA`             | `--client-tls-ca`             |
-| `T4_AUTH_ENABLED`              | `--auth-enabled`              |
-| `T4_TOKEN_TTL`                 | `--token-ttl`                 |
-| `T4_METRICS_ADDR`              | `--metrics-addr`              |
-| `T4_BRANCH_PREFIX`             | `--branch-prefix`             |
-| `T4_BRANCH_CHECKPOINT`         | `--branch-checkpoint`         |
+Generated from the CLI flag definitions in Go. Run `go run ./hack/docgen` after changing CLI flags or env
+metadata.
+
+<!-- BEGIN GENERATED: cli-env-vars -->
+| Command | Environment variable | Equivalent flag |
+|---------|----------------------|-----------------|
+| `t4 branch fork` | `T4_BRANCH_ID` | `--branch-id` |
+| `t4 branch fork` | `T4_S3_ACCESS_KEY_ID` | `--s3-access-key-id` |
+| `t4 branch fork` | `T4_S3_BUCKET` | `--s3-bucket` |
+| `t4 branch fork` | `T4_S3_ENDPOINT` | `--s3-endpoint` |
+| `t4 branch fork` | `T4_S3_PREFIX` | `--s3-prefix` |
+| `t4 branch fork` | `T4_S3_PROFILE` | `--s3-profile` |
+| `t4 branch fork` | `T4_S3_REGION` | `--s3-region` |
+| `t4 branch fork` | `T4_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` |
+| `t4 branch unfork` | `T4_BRANCH_ID` | `--branch-id` |
+| `t4 branch unfork` | `T4_S3_ACCESS_KEY_ID` | `--s3-access-key-id` |
+| `t4 branch unfork` | `T4_S3_BUCKET` | `--s3-bucket` |
+| `t4 branch unfork` | `T4_S3_ENDPOINT` | `--s3-endpoint` |
+| `t4 branch unfork` | `T4_S3_PREFIX` | `--s3-prefix` |
+| `t4 branch unfork` | `T4_S3_PROFILE` | `--s3-profile` |
+| `t4 branch unfork` | `T4_S3_REGION` | `--s3-region` |
+| `t4 branch unfork` | `T4_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` |
+| `t4 gc` | `T4_S3_ACCESS_KEY_ID` | `--s3-access-key-id` |
+| `t4 gc` | `T4_S3_BUCKET` | `--s3-bucket` |
+| `t4 gc` | `T4_S3_ENDPOINT` | `--s3-endpoint` |
+| `t4 gc` | `T4_S3_PREFIX` | `--s3-prefix` |
+| `t4 gc` | `T4_S3_PROFILE` | `--s3-profile` |
+| `t4 gc` | `T4_S3_REGION` | `--s3-region` |
+| `t4 gc` | `T4_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` |
+| `t4 inspect count` | `T4_DATA_DIR` | `--data-dir` |
+| `t4 inspect diff` | `T4_DATA_DIR` | `--data-dir` |
+| `t4 inspect get` | `T4_DATA_DIR` | `--data-dir` |
+| `t4 inspect history` | `T4_DATA_DIR` | `--data-dir` |
+| `t4 inspect list` | `T4_DATA_DIR` | `--data-dir` |
+| `t4 inspect meta` | `T4_DATA_DIR` | `--data-dir` |
+| `t4 restore checkpoint` | `T4_DATA_DIR` | `--data-dir` |
+| `t4 restore checkpoint` | `T4_S3_ACCESS_KEY_ID` | `--s3-access-key-id` |
+| `t4 restore checkpoint` | `T4_S3_BUCKET` | `--s3-bucket` |
+| `t4 restore checkpoint` | `T4_S3_ENDPOINT` | `--s3-endpoint` |
+| `t4 restore checkpoint` | `T4_S3_PREFIX` | `--s3-prefix` |
+| `t4 restore checkpoint` | `T4_S3_PROFILE` | `--s3-profile` |
+| `t4 restore checkpoint` | `T4_S3_REGION` | `--s3-region` |
+| `t4 restore checkpoint` | `T4_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` |
+| `t4 restore list` | `T4_S3_ACCESS_KEY_ID` | `--s3-access-key-id` |
+| `t4 restore list` | `T4_S3_BUCKET` | `--s3-bucket` |
+| `t4 restore list` | `T4_S3_ENDPOINT` | `--s3-endpoint` |
+| `t4 restore list` | `T4_S3_PREFIX` | `--s3-prefix` |
+| `t4 restore list` | `T4_S3_PROFILE` | `--s3-profile` |
+| `t4 restore list` | `T4_S3_REGION` | `--s3-region` |
+| `t4 restore list` | `T4_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` |
+| `t4 run` | `T4_ADVERTISE_PEER` | `--advertise-peer` |
+| `t4 run` | `T4_AUTH_ENABLED` | `--auth-enabled` |
+| `t4 run` | `T4_BRANCH_CHECKPOINT` | `--branch-checkpoint` |
+| `t4 run` | `T4_BRANCH_PREFIX` | `--branch-prefix` |
+| `t4 run` | `T4_CHECKPOINT_ENTRIES` | `--checkpoint-entries` |
+| `t4 run` | `T4_CHECKPOINT_INTERVAL_MIN` | `--checkpoint-interval-min` |
+| `t4 run` | `T4_CLIENT_TLS_CA` | `--client-tls-ca` |
+| `t4 run` | `T4_CLIENT_TLS_CERT` | `--client-tls-cert` |
+| `t4 run` | `T4_CLIENT_TLS_KEY` | `--client-tls-key` |
+| `t4 run` | `T4_DATA_DIR` | `--data-dir` |
+| `t4 run` | `T4_FOLLOWER_MAX_RETRIES` | `--follower-max-retries` |
+| `t4 run` | `T4_FOLLOWER_WAIT_MODE` | `--follower-wait-mode` |
+| `t4 run` | `T4_GRPC_KEEPALIVE_INTERVAL` | `--grpc-keepalive-interval` |
+| `t4 run` | `T4_GRPC_KEEPALIVE_MIN_TIME` | `--grpc-keepalive-min-time` |
+| `t4 run` | `T4_GRPC_KEEPALIVE_PERMIT_WITHOUT_STREAM` | `--grpc-keepalive-permit-without-stream` |
+| `t4 run` | `T4_GRPC_KEEPALIVE_TIMEOUT` | `--grpc-keepalive-timeout` |
+| `t4 run` | `T4_LEADER_WATCH_INTERVAL_SEC` | `--leader-watch-interval-sec` |
+| `t4 run` | `T4_LISTEN` | `--listen` |
+| `t4 run` | `T4_LOG_LEVEL` | `--log-level` |
+| `t4 run` | `T4_METRICS_ADDR` | `--metrics-addr` |
+| `t4 run` | `T4_NODE_ID` | `--node-id` |
+| `t4 run` | `T4_PEER_LISTEN` | `--peer-listen` |
+| `t4 run` | `T4_PEER_TLS_CA` | `--peer-tls-ca` |
+| `t4 run` | `T4_PEER_TLS_CERT` | `--peer-tls-cert` |
+| `t4 run` | `T4_PEER_TLS_KEY` | `--peer-tls-key` |
+| `t4 run` | `T4_READ_CONSISTENCY` | `--read-consistency` |
+| `t4 run` | `T4_S3_ACCESS_KEY_ID` | `--s3-access-key-id` |
+| `t4 run` | `T4_S3_BUCKET` | `--s3-bucket` |
+| `t4 run` | `T4_S3_ENDPOINT` | `--s3-endpoint` |
+| `t4 run` | `T4_S3_PREFIX` | `--s3-prefix` |
+| `t4 run` | `T4_S3_PROFILE` | `--s3-profile` |
+| `t4 run` | `T4_S3_REGION` | `--s3-region` |
+| `t4 run` | `T4_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` |
+| `t4 run` | `T4_SEGMENT_MAX_AGE_SEC` | `--segment-max-age-sec` |
+| `t4 run` | `T4_SEGMENT_MAX_SIZE_MB` | `--segment-max-size-mb` |
+| `t4 run` | `T4_TOKEN_TTL` | `--token-ttl` |
+| `t4 run` | `T4_WAL_SYNC_UPLOAD` | `--wal-sync-upload` |
+| `t4 status` | `T4_S3_ACCESS_KEY_ID` | `--s3-access-key-id` |
+| `t4 status` | `T4_S3_BUCKET` | `--s3-bucket` |
+| `t4 status` | `T4_S3_ENDPOINT` | `--s3-endpoint` |
+| `t4 status` | `T4_S3_PREFIX` | `--s3-prefix` |
+| `t4 status` | `T4_S3_PROFILE` | `--s3-profile` |
+| `t4 status` | `T4_S3_REGION` | `--s3-region` |
+| `t4 status` | `T4_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` |
+<!-- END GENERATED: cli-env-vars -->
 
 | Flag                          | Default          | Description                                                                                                                                                                                                                                                                        |
 |-------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

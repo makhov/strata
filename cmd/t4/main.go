@@ -4,25 +4,11 @@ package main
 import (
 	"os"
 
-	"github.com/spf13/cobra"
+	"github.com/t4db/t4/internal/cli"
 )
 
 func main() {
-	if err := rootCmd().Execute(); err != nil {
+	if err := cli.NewRootCmd().Execute(); err != nil {
 		os.Exit(1)
 	}
-}
-
-func rootCmd() *cobra.Command {
-	root := &cobra.Command{
-		Use:   "t4",
-		Short: "S3-durable kine-compatible datastore",
-	}
-	root.AddCommand(runCmd())
-	root.AddCommand(branchCmd())
-	root.AddCommand(restoreCmd())
-	root.AddCommand(gcCmd())
-	root.AddCommand(statusCmd())
-	root.AddCommand(inspectCmd())
-	return root
 }

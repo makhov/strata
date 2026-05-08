@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bytes"
@@ -67,7 +67,7 @@ func TestRestoreCheckpointFromS3Smoke(t *testing.T) {
 	}
 
 	listOut := &bytes.Buffer{}
-	listCmd := rootCmd()
+	listCmd := NewRootCmd()
 	listCmd.SetOut(listOut)
 	listCmd.SetErr(listOut)
 	listCmd.SetArgs(append([]string{"restore", "list"}, restoreS3Args(endpoint, prefix)...))
@@ -80,7 +80,7 @@ func TestRestoreCheckpointFromS3Smoke(t *testing.T) {
 
 	restoreDir := t.TempDir()
 	restoreOut := &bytes.Buffer{}
-	restoreCmd := rootCmd()
+	restoreCmd := NewRootCmd()
 	restoreCmd.SetOut(restoreOut)
 	restoreCmd.SetErr(restoreOut)
 	restoreCmd.SetArgs(append([]string{"restore", "checkpoint", "--data-dir", restoreDir}, restoreS3Args(endpoint, prefix)...))
@@ -92,7 +92,7 @@ func TestRestoreCheckpointFromS3Smoke(t *testing.T) {
 	}
 
 	countOut := &bytes.Buffer{}
-	countCmd := rootCmd()
+	countCmd := NewRootCmd()
 	countCmd.SetOut(countOut)
 	countCmd.SetErr(countOut)
 	countCmd.SetArgs([]string{"inspect", "count", "--data-dir", restoreDir, "--prefix", "/restore/"})

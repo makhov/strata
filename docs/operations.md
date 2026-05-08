@@ -947,9 +947,9 @@ Checkpoint manifests and index files are JSON. Both include a `format_version` f
 version is **1**. Older nodes that do not know this field treat it as version 0 (the original format) — identical to
 version 1.
 
-When a node reads a manifest or index with `format_version` higher than it knows, it logs a warning and continues. A
-future incompatible change will increment `format_version` and require the old nodes to be upgraded before they can read
-new checkpoints.
+When a node reads a manifest or index with `format_version` higher than it knows, it rejects the checkpoint with a clear
+upgrade-required error. A future incompatible change will increment `format_version` and require the old nodes to be
+upgraded before they can read new checkpoints.
 
 **Compatibility rule:** adding new JSON fields with `omitempty` is always backward-compatible. Only structural changes
 that alter how existing fields are interpreted require a version bump.

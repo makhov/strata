@@ -12,6 +12,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  docs-generated:
+    name: Check Generated Docs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Regenerate CLI environment reference
+        run: go run ./hack/docgen
+
+      - name: Check generated docs are up to date
+        run: git diff --exit-code -- docs/configuration.md website/src/content/docs/configuration.md
+
   test-unit:
     name: Test Unit (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
