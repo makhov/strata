@@ -60,7 +60,8 @@ jobs:
             ./etcd \
             ./etcd/auth \
             ./internal/... \
-            ./pkg/object
+            ./pkg/object \
+            ./tests/tla
 
   test-integration-linux:
     name: Test Integration (Linux)
@@ -79,6 +80,21 @@ jobs:
 
       - name: Test (integration)
         run: go test -short -timeout 360s -count=1 ./tests/integration
+
+  model-check-tla:
+    name: Model Check TLA+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Check TLA+ models
+        run: make tla
 
   test-race-linux:
     name: Test Race (Linux)

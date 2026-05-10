@@ -101,6 +101,39 @@ func TestTakeOverAfterLeaderDead(t *testing.T) {
 	}
 }
 
+func TestTakeOverRejectsCandidateBehindCommittedRev(t *testing.T) {
+	store := object.NewMem()
+	l1 := newLockShared(store, "node-1", "localhost:2380")
+	l2 := newLockShared(store, "node-2", "localhost:2381")
+
+	rec1, won1, err := l1.TryAcquire(context.Background(), 0, 10)
+	if err != nil || !won1 {
+		t.Fatalf("node-1 should win: won=%v err=%v", won1, err)
+	}
+	if rec1.CommittedRev != 10 {
+		t.Fatalf("setup committed rev: want 10 got %d", rec1.CommittedRev)
+	}
+
+	rec2, won2, err := l2.TakeOver(context.Background(), rec1.Term, 9)
+	if err != nil {
+		t.Fatalf("TakeOver: %v", err)
+	}
+	if won2 {
+		t.Fatal("behind candidate should not win TakeOver")
+	}
+	if rec2 == nil || rec2.NodeID != "node-1" || rec2.CommittedRev != 10 {
+		t.Fatalf("TakeOver should return existing leader lock, got %+v", rec2)
+	}
+
+	current, err := l1.Read(context.Background())
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if current.NodeID != "node-1" || current.Term != rec1.Term || current.CommittedRev != 10 {
+		t.Fatalf("lock changed after rejected TakeOver: got %+v want node-1 term=%d committedRev=10", current, rec1.Term)
+	}
+}
+
 func TestTakeOverRace(t *testing.T) {
 	// Two followers simultaneously attempt TakeOver — exactly one should win.
 	store := object.NewMem()
