@@ -27,8 +27,8 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Regenerate CLI environment reference
-        run: go run ./hack/docgen
+      - name: Regenerate generated docs
+        run: make docs-generate
 
       - name: Check generated docs are up to date
         run: git diff --exit-code -- docs/configuration.md website/src/content/docs/configuration.md

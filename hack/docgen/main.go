@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	envBlockStart = "<!-- BEGIN GENERATED: cli-env-vars -->"
-	envBlockEnd   = "<!-- END GENERATED: cli-env-vars -->"
+	envBlockStart  = "<!-- BEGIN GENERATED: cli-env-vars -->"
+	envBlockEnd    = "<!-- END GENERATED: cli-env-vars -->"
+	flagBlockStart = "<!-- BEGIN GENERATED: cli-flags -->"
+	flagBlockEnd   = "<!-- END GENERATED: cli-flags -->"
 )
 
 type envRef struct {
@@ -25,13 +27,27 @@ type envRef struct {
 	Flag    string
 }
 
+type flagRef struct {
+	Command  string
+	Flag     string
+	Default  string
+	Env      string
+	Required bool
+	Help     string
+}
+
 func main() {
-	block := renderEnvReference(cli.NewRootCmd())
+	envBlock := renderEnvReference(cli.NewRootCmd())
+	flagBlock := renderFlagReference(cli.NewRootCmd())
 	for _, path := range []string{
 		"docs/configuration.md",
 		"website/src/content/docs/configuration.md",
 	} {
-		if err := replaceGeneratedBlock(path, envBlockStart, envBlockEnd, block); err != nil {
+		if err := replaceGeneratedBlock(path, envBlockStart, envBlockEnd, envBlock); err != nil {
+			fmt.Fprintf(os.Stderr, "generate configuration docs: %v\n", err)
+			os.Exit(1)
+		}
+		if err := replaceGeneratedBlock(path, flagBlockStart, flagBlockEnd, flagBlock); err != nil {
 			fmt.Fprintf(os.Stderr, "generate configuration docs: %v\n", err)
 			os.Exit(1)
 		}
@@ -49,6 +65,32 @@ func renderEnvReference(root *cobra.Command) string {
 		fmt.Fprintf(&b, "| `%s` | `%s` | `%s` |\n", ref.Command, ref.Env, ref.Flag)
 	}
 	b.WriteString(envBlockEnd)
+	b.WriteString("\n")
+	return b.String()
+}
+
+func renderFlagReference(root *cobra.Command) string {
+	refs := collectFlagRefs(root)
+	var b bytes.Buffer
+	b.WriteString(flagBlockStart)
+	b.WriteString("\n")
+	b.WriteString("| Command | Flag | Default | Env | Required | Help |\n")
+	b.WriteString("|---------|------|---------|-----|----------|------|\n")
+	for _, ref := range refs {
+		required := "No"
+		if ref.Required {
+			required = "Yes"
+		}
+		fmt.Fprintf(&b, "| `%s` | `%s` | %s | %s | %s | %s |\n",
+			ref.Command,
+			ref.Flag,
+			codeOrDash(ref.Default),
+			codeOrDash(ref.Env),
+			required,
+			escapeMarkdownTable(ref.Help),
+		)
+	}
+	b.WriteString(flagBlockEnd)
 	b.WriteString("\n")
 	return b.String()
 }
@@ -87,6 +129,77 @@ func collectEnvRefs(root *cobra.Command) []envRef {
 		return refs[i].Flag < refs[j].Flag
 	})
 	return refs
+}
+
+func collectFlagRefs(root *cobra.Command) []flagRef {
+	envPattern := regexp.MustCompile(`\(env: (T4_[A-Z0-9_]+)\)`)
+	var refs []flagRef
+
+	var walk func(*cobra.Command, []string)
+	walk = func(cmd *cobra.Command, path []string) {
+		cmdPath := strings.Join(append(path, cmd.Name()), " ")
+		cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+			if flag.Hidden {
+				return
+			}
+			env := ""
+			if m := envPattern.FindStringSubmatch(flag.Usage); m != nil {
+				env = m[1]
+			}
+			refs = append(refs, flagRef{
+				Command:  cmdPath,
+				Flag:     "--" + flag.Name,
+				Default:  flag.DefValue,
+				Env:      env,
+				Required: isRequired(flag),
+				Help:     cleanHelp(flag.Usage),
+			})
+		})
+		for _, child := range cmd.Commands() {
+			walk(child, append(path, cmd.Name()))
+		}
+	}
+	walk(root, nil)
+
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Command != refs[j].Command {
+			return refs[i].Command < refs[j].Command
+		}
+		return refs[i].Flag < refs[j].Flag
+	})
+	return refs
+}
+
+func isRequired(flag *pflag.Flag) bool {
+	if len(flag.Annotations[cobra.BashCompOneRequiredFlag]) > 0 {
+		return true
+	}
+	if len(flag.Annotations["cobra_annotation_required"]) > 0 {
+		return true
+	}
+	return false
+}
+
+func cleanHelp(help string) string {
+	envPattern := regexp.MustCompile(`\s*\(env: T4_[A-Z0-9_]+\)`)
+	return strings.TrimSpace(envPattern.ReplaceAllString(help, ""))
+}
+
+func codeOrDash(value string) string {
+	if value == "" {
+		return "—"
+	}
+	return "`" + escapeBackticks(escapeMarkdownTable(value)) + "`"
+}
+
+func escapeMarkdownTable(value string) string {
+	value = strings.ReplaceAll(value, "\n", " ")
+	value = strings.ReplaceAll(value, "|", "\\|")
+	return strings.TrimSpace(value)
+}
+
+func escapeBackticks(value string) string {
+	return strings.ReplaceAll(value, "`", "\\`")
 }
 
 func replaceGeneratedBlock(path, start, end, replacement string) error {

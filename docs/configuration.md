@@ -212,44 +212,118 @@ metadata.
 | `t4 status` | `T4_S3_SECRET_ACCESS_KEY` | `--s3-secret-access-key` |
 <!-- END GENERATED: cli-env-vars -->
 
-| Flag                                     | Default          | Description                                                                                                                                                                                                                                                                        |
-|------------------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--data-dir`                             | `/var/lib/t4`    | Pebble + WAL storage directory                                                                                                                                                                                                                                                     |
-| `--listen`                               | `0.0.0.0:3379`   | etcd v3 gRPC listen address                                                                                                                                                                                                                                                        |
-| `--s3-bucket`                            | —                | S3 bucket name                                                                                                                                                                                                                                                                     |
-| `--s3-prefix`                            | —                | Key prefix inside the bucket (no trailing slash needed)                                                                                                                                                                                                                            |
-| `--s3-endpoint`                          | —                | Custom S3 endpoint URL (MinIO, Ceph, etc.)                                                                                                                                                                                                                                         |
-| `--s3-region`                            | —                | S3 region used for the configured S3 client                                                                                                                                                                                                                                        |
-| `--s3-profile`                           | —                | Named AWS shared config profile to use. `t4` only enables the AWS shared config chain when this is set explicitly; use `default` to opt in to the default profile.                                                                                                                 |
-| `--s3-access-key-id`                     | —                | t4 S3 access key ID; when set with `--s3-secret-access-key`, uses static credentials                                                                                                                                                                                               |
-| `--s3-secret-access-key`                 | —                | S3 secret access key (required when `--s3-access-key-id` is set)                                                                                                                                                                                                                   |
-| `--segment-max-size-mb`                  | `50`             | WAL segment rotation size threshold (MiB)                                                                                                                                                                                                                                          |
-| `--segment-max-age-sec`                  | `10`             | WAL segment rotation age (seconds)                                                                                                                                                                                                                                                 |
-| `--wal-sync-upload`                      | _(default true)_ | Upload WAL segments synchronously before acknowledging writes (`true`/`false`). Applies to single-node mode. In cluster mode the leader always uses async uploads (hardcoded in `becomeLeader`); set to `false` when local storage is durable for lower single-node write latency. |
-| `--checkpoint-interval-min`              | `15`             | Checkpoint write interval (minutes)                                                                                                                                                                                                                                                |
-| `--checkpoint-entries`                   | `0`              | Also checkpoint after N WAL entries (0 = disabled)                                                                                                                                                                                                                                 |
-| `--log-level`                            | `info`           | Log level: `trace` `debug` `info` `warn` `error`                                                                                                                                                                                                                                   |
-| `--node-id`                              | hostname         | Stable unique node identifier                                                                                                                                                                                                                                                      |
-| `--peer-listen`                          | —                | Peer WAL stream listen address; enables multi-node mode                                                                                                                                                                                                                            |
-| `--advertise-peer`                       | `--peer-listen`  | Advertised peer address (use when behind NAT)                                                                                                                                                                                                                                      |
-| `--leader-watch-interval-sec`            | `300`            | Leader lock re-read interval (seconds)                                                                                                                                                                                                                                             |
-| `--follower-max-retries`                 | `5`              | Stream failures before a follower attempts takeover                                                                                                                                                                                                                                |
-| `--follower-wait-mode`                   | `quorum`         | Follower ACK wait policy before leader commit: `none`, `quorum`, or `all`                                                                                                                                                                                                          |
-| `--peer-tls-ca`                          | —                | CA certificate for peer mTLS (PEM file)                                                                                                                                                                                                                                            |
-| `--peer-tls-cert`                        | —                | Node certificate for peer mTLS (PEM file)                                                                                                                                                                                                                                          |
-| `--peer-tls-key`                         | —                | Node private key for peer mTLS (PEM file)                                                                                                                                                                                                                                          |
-| `--client-tls-cert`                      | —                | Server certificate for client-facing TLS on the etcd port (PEM file)                                                                                                                                                                                                               |
-| `--client-tls-key`                       | —                | Server private key for client-facing TLS (PEM file)                                                                                                                                                                                                                                |
-| `--client-tls-ca`                        | —                | CA certificate for client mTLS; omit for server-only TLS (PEM file)                                                                                                                                                                                                                |
-| `--auth-enabled`                         | `false`          | Enable etcd-compatible authentication and RBAC                                                                                                                                                                                                                                     |
-| `--token-ttl`                            | `300`            | Bearer token lifetime in seconds                                                                                                                                                                                                                                                   |
-| `--metrics-addr`                         | —                | HTTP address for metrics and health endpoints                                                                                                                                                                                                                                      |
-| `--branch-prefix`                        | —                | S3 prefix of the source database (branch nodes only; uses `--s3-bucket`)                                                                                                                                                                                                           |
-| `--branch-checkpoint`                    | —                | Checkpoint key to fork from (branch nodes only; omit to use latest)                                                                                                                                                                                                                |
-| `--grpc-keepalive-min-time`              | `5s`             | Minimum interval the server demands between client keepalive pings. Pings closer than this earn a strike; two strikes trigger `GOAWAY too_many_pings`. Lower than the etcd v3 client's 30s default; raising it risks connection resets for aggressive clients (kube-apiserver).    |
-| `--grpc-keepalive-interval`              | `2h`             | Server-side keepalive ping interval. The server pings idle connections this often.                                                                                                                                                                                                 |
-| `--grpc-keepalive-timeout`               | `20s`            | How long the server waits for a ping ack before declaring the connection dead.                                                                                                                                                                                                     |
-| `--grpc-keepalive-permit-without-stream` | `true`           | Accept client pings even when no streams are active. Required for etcd v3 client compatibility — etcd clients ping the connection itself, not a specific stream.                                                                                                                   |
+#### CLI flag reference
+
+Generated from the CLI flag definitions in Go. Run `go run ./hack/docgen` after changing CLI commands or flags.
+
+<!-- BEGIN GENERATED: cli-flags -->
+| Command | Flag | Default | Env | Required | Help |
+|---------|------|---------|-----|----------|------|
+| `t4 branch fork` | `--branch-id` | — | `T4_BRANCH_ID` | Yes | unique identifier for this branch (required) |
+| `t4 branch fork` | `--checkpoint` | — | — | No | fork from this specific checkpoint key instead of the latest revision |
+| `t4 branch fork` | `--s3-access-key-id` | — | `T4_S3_ACCESS_KEY_ID` | No | t4 S3 access key ID; when set with --s3-secret-access-key, uses static credentials |
+| `t4 branch fork` | `--s3-bucket` | — | `T4_S3_BUCKET` | Yes | S3 bucket |
+| `t4 branch fork` | `--s3-endpoint` | — | `T4_S3_ENDPOINT` | No | custom S3 endpoint URL, e.g. for MinIO |
+| `t4 branch fork` | `--s3-prefix` | — | `T4_S3_PREFIX` | No | key prefix inside the S3 bucket |
+| `t4 branch fork` | `--s3-profile` | — | `T4_S3_PROFILE` | No | named AWS shared config profile to use; t4 only enables the AWS shared config chain when this is set (use 'default' to opt in to the default profile) |
+| `t4 branch fork` | `--s3-region` | — | `T4_S3_REGION` | No | AWS region |
+| `t4 branch fork` | `--s3-secret-access-key` | — | `T4_S3_SECRET_ACCESS_KEY` | No | AWS secret access key |
+| `t4 branch unfork` | `--branch-id` | — | `T4_BRANCH_ID` | Yes | unique identifier for this branch (required) |
+| `t4 branch unfork` | `--s3-access-key-id` | — | `T4_S3_ACCESS_KEY_ID` | No | t4 S3 access key ID; when set with --s3-secret-access-key, uses static credentials |
+| `t4 branch unfork` | `--s3-bucket` | — | `T4_S3_BUCKET` | Yes | S3 bucket |
+| `t4 branch unfork` | `--s3-endpoint` | — | `T4_S3_ENDPOINT` | No | custom S3 endpoint URL, e.g. for MinIO |
+| `t4 branch unfork` | `--s3-prefix` | — | `T4_S3_PREFIX` | No | key prefix inside the S3 bucket |
+| `t4 branch unfork` | `--s3-profile` | — | `T4_S3_PROFILE` | No | named AWS shared config profile to use; t4 only enables the AWS shared config chain when this is set (use 'default' to opt in to the default profile) |
+| `t4 branch unfork` | `--s3-region` | — | `T4_S3_REGION` | No | AWS region |
+| `t4 branch unfork` | `--s3-secret-access-key` | — | `T4_S3_SECRET_ACCESS_KEY` | No | AWS secret access key |
+| `t4 gc` | `--keep` | `3` | — | No | number of most-recent checkpoints to retain |
+| `t4 gc` | `--s3-access-key-id` | — | `T4_S3_ACCESS_KEY_ID` | No | t4 S3 access key ID; when set with --s3-secret-access-key, uses static credentials |
+| `t4 gc` | `--s3-bucket` | — | `T4_S3_BUCKET` | Yes | S3 bucket |
+| `t4 gc` | `--s3-endpoint` | — | `T4_S3_ENDPOINT` | No | custom S3 endpoint URL, e.g. for MinIO |
+| `t4 gc` | `--s3-prefix` | — | `T4_S3_PREFIX` | No | key prefix inside the S3 bucket |
+| `t4 gc` | `--s3-profile` | — | `T4_S3_PROFILE` | No | named AWS shared config profile to use; t4 only enables the AWS shared config chain when this is set (use 'default' to opt in to the default profile) |
+| `t4 gc` | `--s3-region` | — | `T4_S3_REGION` | No | AWS region |
+| `t4 gc` | `--s3-secret-access-key` | — | `T4_S3_SECRET_ACCESS_KEY` | No | AWS secret access key |
+| `t4 inspect count` | `--data-dir` | `/var/lib/t4` | `T4_DATA_DIR` | No | directory containing local Pebble data |
+| `t4 inspect count` | `--json` | `false` | — | No | emit JSON output |
+| `t4 inspect count` | `--prefix` | — | — | No | only count keys with this prefix |
+| `t4 inspect diff` | `--data-dir` | `/var/lib/t4` | `T4_DATA_DIR` | No | directory containing local Pebble data |
+| `t4 inspect diff` | `--from-rev` | `1` | — | No | start revision, inclusive |
+| `t4 inspect diff` | `--json` | `false` | — | No | emit JSON output |
+| `t4 inspect diff` | `--prefix` | — | — | No | only include keys with this prefix |
+| `t4 inspect diff` | `--to-rev` | `0` | — | No | end revision, inclusive; defaults to current revision |
+| `t4 inspect get` | `--data-dir` | `/var/lib/t4` | `T4_DATA_DIR` | No | directory containing local Pebble data |
+| `t4 inspect get` | `--json` | `false` | — | No | emit JSON output |
+| `t4 inspect history` | `--data-dir` | `/var/lib/t4` | `T4_DATA_DIR` | No | directory containing local Pebble data |
+| `t4 inspect history` | `--json` | `false` | — | No | emit JSON output |
+| `t4 inspect history` | `--limit` | `100` | — | No | maximum number of history events to print; 0 means no limit |
+| `t4 inspect list` | `--data-dir` | `/var/lib/t4` | `T4_DATA_DIR` | No | directory containing local Pebble data |
+| `t4 inspect list` | `--json` | `false` | — | No | emit JSON output |
+| `t4 inspect list` | `--limit` | `100` | — | No | maximum number of keys to print; 0 means no limit |
+| `t4 inspect list` | `--prefix` | — | — | No | only return keys with this prefix |
+| `t4 inspect meta` | `--data-dir` | `/var/lib/t4` | `T4_DATA_DIR` | No | directory containing local Pebble data |
+| `t4 inspect meta` | `--json` | `false` | — | No | emit JSON output |
+| `t4 restore checkpoint` | `--checkpoint` | — | — | No | checkpoint key to restore (default: latest; use 't4 restore list' to find keys) |
+| `t4 restore checkpoint` | `--data-dir` | — | `T4_DATA_DIR` | Yes | local directory to restore into (required; must not already contain a Pebble database) |
+| `t4 restore checkpoint` | `--s3-access-key-id` | — | `T4_S3_ACCESS_KEY_ID` | No | t4 S3 access key ID; when set with --s3-secret-access-key, uses static credentials |
+| `t4 restore checkpoint` | `--s3-bucket` | — | `T4_S3_BUCKET` | Yes | S3 bucket |
+| `t4 restore checkpoint` | `--s3-endpoint` | — | `T4_S3_ENDPOINT` | No | custom S3 endpoint URL, e.g. for MinIO |
+| `t4 restore checkpoint` | `--s3-prefix` | — | `T4_S3_PREFIX` | No | key prefix inside the S3 bucket |
+| `t4 restore checkpoint` | `--s3-profile` | — | `T4_S3_PROFILE` | No | named AWS shared config profile to use; t4 only enables the AWS shared config chain when this is set (use 'default' to opt in to the default profile) |
+| `t4 restore checkpoint` | `--s3-region` | — | `T4_S3_REGION` | No | AWS region |
+| `t4 restore checkpoint` | `--s3-secret-access-key` | — | `T4_S3_SECRET_ACCESS_KEY` | No | AWS secret access key |
+| `t4 restore list` | `--s3-access-key-id` | — | `T4_S3_ACCESS_KEY_ID` | No | t4 S3 access key ID; when set with --s3-secret-access-key, uses static credentials |
+| `t4 restore list` | `--s3-bucket` | — | `T4_S3_BUCKET` | Yes | S3 bucket |
+| `t4 restore list` | `--s3-endpoint` | — | `T4_S3_ENDPOINT` | No | custom S3 endpoint URL, e.g. for MinIO |
+| `t4 restore list` | `--s3-prefix` | — | `T4_S3_PREFIX` | No | key prefix inside the S3 bucket |
+| `t4 restore list` | `--s3-profile` | — | `T4_S3_PROFILE` | No | named AWS shared config profile to use; t4 only enables the AWS shared config chain when this is set (use 'default' to opt in to the default profile) |
+| `t4 restore list` | `--s3-region` | — | `T4_S3_REGION` | No | AWS region |
+| `t4 restore list` | `--s3-secret-access-key` | — | `T4_S3_SECRET_ACCESS_KEY` | No | AWS secret access key |
+| `t4 run` | `--advertise-peer` | — | `T4_ADVERTISE_PEER` | No | address followers use to reach this node's peer stream (default: --peer-listen) |
+| `t4 run` | `--auth-enabled` | `false` | `T4_AUTH_ENABLED` | No | enable etcd-compatible authentication and RBAC |
+| `t4 run` | `--branch-checkpoint` | — | `T4_BRANCH_CHECKPOINT` | No | checkpoint index key returned by 't4 branch fork' (required with --branch-prefix) |
+| `t4 run` | `--branch-prefix` | — | `T4_BRANCH_PREFIX` | No | S3 key prefix of the source node to branch from (uses --s3-bucket) |
+| `t4 run` | `--checkpoint-entries` | `0` | `T4_CHECKPOINT_ENTRIES` | No | triggers a checkpoint after this many WAL entries regardless of time. 0 means disabled (requires --s3-bucket) |
+| `t4 run` | `--checkpoint-interval-min` | `15` | `T4_CHECKPOINT_INTERVAL_MIN` | No | checkpoint interval in minutes (requires --s3-bucket) |
+| `t4 run` | `--client-tls-ca` | — | `T4_CLIENT_TLS_CA` | No | CA certificate for client mTLS (PEM); omit for server-only TLS |
+| `t4 run` | `--client-tls-cert` | — | `T4_CLIENT_TLS_CERT` | No | server certificate file for client-facing TLS (PEM) |
+| `t4 run` | `--client-tls-key` | — | `T4_CLIENT_TLS_KEY` | No | server private key file for client-facing TLS (PEM) |
+| `t4 run` | `--data-dir` | `/var/lib/t4` | `T4_DATA_DIR` | No | directory for Pebble data and local WAL segments |
+| `t4 run` | `--follower-max-retries` | `5` | `T4_FOLLOWER_MAX_RETRIES` | No | consecutive stream failures before a follower attempts a leader takeover |
+| `t4 run` | `--follower-wait-mode` | `quorum` | `T4_FOLLOWER_WAIT_MODE` | No | leader wait policy for follower ACKs before commit: none, quorum, or all |
+| `t4 run` | `--grpc-keepalive-interval` | `2h0m0s` | `T4_GRPC_KEEPALIVE_INTERVAL` | No | server keepalive ping interval; how often the server pings idle connections |
+| `t4 run` | `--grpc-keepalive-min-time` | `5s` | `T4_GRPC_KEEPALIVE_MIN_TIME` | No | minimum interval the server demands between client keepalive pings |
+| `t4 run` | `--grpc-keepalive-permit-without-stream` | `true` | `T4_GRPC_KEEPALIVE_PERMIT_WITHOUT_STREAM` | No | accept client pings even when no streams are open; required for etcd v3 client compatibility |
+| `t4 run` | `--grpc-keepalive-timeout` | `20s` | `T4_GRPC_KEEPALIVE_TIMEOUT` | No | server keepalive ping ack timeout before declaring the connection dead |
+| `t4 run` | `--leader-watch-interval-sec` | `300` | `T4_LEADER_WATCH_INTERVAL_SEC` | No | how often (seconds) the leader reads the lock to detect supersession |
+| `t4 run` | `--listen` | `0.0.0.0:3379` | `T4_LISTEN` | No | gRPC listen address (kine/etcd protocol) |
+| `t4 run` | `--log-level` | `info` | `T4_LOG_LEVEL` | No | log level (trace/debug/info/warn/error) |
+| `t4 run` | `--metrics-addr` | `0.0.0.0:9090` | `T4_METRICS_ADDR` | No | HTTP address for /metrics, /healthz, /readyz (e.g. 0.0.0.0:9090) |
+| `t4 run` | `--node-id` | — | `T4_NODE_ID` | No | stable unique node identifier (default: hostname) |
+| `t4 run` | `--peer-listen` | — | `T4_PEER_LISTEN` | No | address for leader→follower WAL stream (e.g. 0.0.0.0:3380); enables multi-node mode |
+| `t4 run` | `--peer-tls-ca` | — | `T4_PEER_TLS_CA` | No | CA certificate file for peer mTLS (PEM) |
+| `t4 run` | `--peer-tls-cert` | — | `T4_PEER_TLS_CERT` | No | node certificate file for peer mTLS (PEM) |
+| `t4 run` | `--peer-tls-key` | — | `T4_PEER_TLS_KEY` | No | node private key file for peer mTLS (PEM) |
+| `t4 run` | `--read-consistency` | `linearizable` | `T4_READ_CONSISTENCY` | No | read consistency for follower nodes: linearizable (ReadIndex, etcd-compatible) or serializable (local, ~115x faster but may be slightly stale) |
+| `t4 run` | `--s3-access-key-id` | — | `T4_S3_ACCESS_KEY_ID` | No | t4 S3 access key ID; when set with --s3-secret-access-key, uses static credentials |
+| `t4 run` | `--s3-bucket` | — | `T4_S3_BUCKET` | No | S3 bucket |
+| `t4 run` | `--s3-endpoint` | — | `T4_S3_ENDPOINT` | No | custom S3 endpoint URL, e.g. for MinIO |
+| `t4 run` | `--s3-prefix` | — | `T4_S3_PREFIX` | No | key prefix inside the S3 bucket |
+| `t4 run` | `--s3-profile` | — | `T4_S3_PROFILE` | No | named AWS shared config profile to use; t4 only enables the AWS shared config chain when this is set (use 'default' to opt in to the default profile) |
+| `t4 run` | `--s3-region` | — | `T4_S3_REGION` | No | AWS region |
+| `t4 run` | `--s3-secret-access-key` | — | `T4_S3_SECRET_ACCESS_KEY` | No | AWS secret access key |
+| `t4 run` | `--segment-max-age-sec` | `10` | `T4_SEGMENT_MAX_AGE_SEC` | No | WAL segment rotation age threshold in seconds |
+| `t4 run` | `--segment-max-size-mb` | `50` | `T4_SEGMENT_MAX_SIZE_MB` | No | WAL segment rotation size threshold in MiB |
+| `t4 run` | `--token-ttl` | `300` | `T4_TOKEN_TTL` | No | bearer token TTL in seconds |
+| `t4 run` | `--wal-sync-upload` | — | `T4_WAL_SYNC_UPLOAD` | No | upload WAL segments synchronously before ack (true/false; default true for safety, set false when local storage is durable) |
+| `t4 status` | `--s3-access-key-id` | — | `T4_S3_ACCESS_KEY_ID` | No | t4 S3 access key ID; when set with --s3-secret-access-key, uses static credentials |
+| `t4 status` | `--s3-bucket` | — | `T4_S3_BUCKET` | Yes | S3 bucket |
+| `t4 status` | `--s3-endpoint` | — | `T4_S3_ENDPOINT` | No | custom S3 endpoint URL, e.g. for MinIO |
+| `t4 status` | `--s3-prefix` | — | `T4_S3_PREFIX` | No | key prefix inside the S3 bucket |
+| `t4 status` | `--s3-profile` | — | `T4_S3_PROFILE` | No | named AWS shared config profile to use; t4 only enables the AWS shared config chain when this is set (use 'default' to opt in to the default profile) |
+| `t4 status` | `--s3-region` | — | `T4_S3_REGION` | No | AWS region |
+| `t4 status` | `--s3-secret-access-key` | — | `T4_S3_SECRET_ACCESS_KEY` | No | AWS secret access key |
+<!-- END GENERATED: cli-flags -->
 
 ---
 
