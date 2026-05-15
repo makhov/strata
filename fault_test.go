@@ -426,6 +426,94 @@ func TestFollowerDoesNotExposeUncommittedEntryAfterLeaderWALError(t *testing.T) 
 	t.Fatalf("new leader exposed uncommitted key after takeover: %v", fmt.Sprintf("%+v", kv))
 }
 
+// TestFollowerTakesOverAfterLeaderFatalWALError verifies that when the leader's
+// commit loop dies because of a fatal WAL error, the leader steps down on its
+// own (cancels the lock-watch goroutine + stops the peer server) so a follower
+// can win election via the standard liveness-TTL path — without the test or
+// an operator calling Close on the dead leader.
+//
+// Without leader-side stepdown the leader becomes a zombie: dead writer, live
+// lock holder. watchLoop keeps refreshing LastSeenNano, every follower
+// TakeOver attempt loses the liveness check, and the cluster stalls until an
+// operator notices and restarts the node. This regression test guards the
+// stepdown path in commitLoop's defer.
+func TestFollowerTakesOverAfterLeaderFatalWALError(t *testing.T) {
+	store := object.NewMem()
+
+	openNode := func(id string) *Node {
+		t.Helper()
+		addr := freeAddrLocal(t)
+		n, err := Open(Config{
+			DataDir:            t.TempDir(),
+			ObjectStore:        store,
+			NodeID:             id,
+			PeerListenAddr:     addr,
+			AdvertisePeerAddr:  addr,
+			FollowerMaxRetries: 2,
+			PeerBufferSize:     1000,
+			CheckpointInterval: 300 * time.Millisecond,
+			SegmentMaxAge:      200 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("open %s: %v", id, err)
+		}
+		return n
+	}
+
+	a := openNode("node-a")
+	defer func() { _ = a.Close() }()
+	b := openNode("node-b")
+	defer func() { _ = b.Close() }()
+
+	nodes := []*Node{a, b}
+	leader := waitForLeaderNodeLocal(t, nodes, 10*time.Second)
+	var follower *Node
+	for _, n := range nodes {
+		if n != leader {
+			follower = n
+			break
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	seedRev, err := leader.Put(ctx, "/seed", []byte("ok"), 0)
+	if err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+	if err := follower.WaitForRevision(ctx, seedRev); err != nil {
+		t.Fatalf("follower seed WaitForRevision: %v", err)
+	}
+
+	// Drive the leader's commit loop into a fatal-exit path. After this Put
+	// returns, the commit loop will have called return; the defer fences
+	// the node and triggers stepDownOnFatalCommitError.
+	fw := newFakeWAL(leader)
+	fw.setFailNow(true)
+	if _, err := leader.Put(ctx, "/ghost", []byte("should-not-commit"), 0); err == nil {
+		t.Fatal("expected injected WAL failure, got nil")
+	}
+	fw.setFailNow(false)
+
+	// Crucial: do NOT call leader.Close(). The follower must be able to
+	// take over solely because the leader stepped down on its own.
+	//
+	// Stepdown stops the lock-watch goroutine, so LastSeenNano stops being
+	// refreshed. After LeaderLivenessTTL (~6s) the lock is stale enough for
+	// the follower's TakeOver liveness check to proceed. Add slack for CI:
+	// allow up to 20s.
+	newLeader := waitForLeaderNodeLocal(t, []*Node{follower}, 20*time.Second)
+	if newLeader != follower {
+		t.Fatalf("expected follower to take over, got %p", newLeader)
+	}
+
+	// The new leader must accept a write.
+	if _, err := newLeader.Put(ctx, "/after-takeover", []byte("ok"), 0); err != nil {
+		t.Fatalf("write after takeover: %v", err)
+	}
+}
+
 func TestFollowerReconnectDropsStagedUncommittedEntries(t *testing.T) {
 	store := object.NewMem()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

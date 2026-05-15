@@ -193,6 +193,18 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 	// handlers to finish; those handlers (Put/Create/…) acquire fenceMu.RLock()
 	// themselves, so calling Stop() while holding the write lock would deadlock.
 	fencedCheck := func(reason string, touch bool) bool {
+		// A fenced node (Close in flight, commitLoop dead from a fatal
+		// error, or any future code path that flips n.closed) must NOT
+		// refresh LastSeenNano on the cluster lock. Touching the lock
+		// here would assert "I'm a healthy leader" while in fact this
+		// node can no longer make progress, causing followers' TakeOver
+		// to back off on a liveness check and the cluster to stall.
+		// Exit the watch loop instead; whichever path set n.closed is
+		// responsible for tearing down peerGRPC.
+		if n.closed.Load() {
+			n.log.Debugf("t4: leader watch (%s): node fenced — exiting watch loop", reason)
+			return false
+		}
 		n.fenceMu.Lock()
 		rCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		rec, etag, err := lock.ReadETag(rCtx)
@@ -352,6 +364,14 @@ func (n *Node) HandleForward(ctx context.Context, req *peer.ForwardRequest) (*pe
 // It drains writeC, writes all entries to WAL with a single fsync, applies
 // them to Pebble as a batch, and signals each caller's done channel.
 func (n *Node) commitLoop(ctx context.Context) {
+	// fatalExit is set when commitLoop returns because of a WAL or Pebble
+	// error, as opposed to a clean ctx.Done shutdown. In the fatal case the
+	// leader must step down so it does not hold the cluster lock as a
+	// zombie: dead writer, live lock holder. Without stepdown a follower
+	// cannot win TakeOver (the watchLoop keeps LastSeenNano fresh) and the
+	// cluster stalls until an operator restarts the dead node.
+	var fatalExit bool
+
 	defer func() {
 		// Fence the node first so new writers fail fast.
 		n.closed.Store(true)
@@ -377,6 +397,9 @@ func (n *Node) commitLoop(ctx context.Context) {
 			case req := <-n.writeC:
 				req.done <- ErrClosed
 			default:
+				if fatalExit {
+					n.stepDownOnFatalCommitError()
+				}
 				return
 			}
 		}
@@ -484,9 +507,36 @@ func (n *Node) commitLoop(ctx context.Context) {
 				continue
 			}
 			// A WAL or Pebble error leaves the segment in an unknown state.
-			// Stop accepting writes immediately; the defer will fence the node.
+			// Stop accepting writes immediately; the defer fences the node
+			// and triggers leader stepdown so followers can take over.
+			fatalExit = true
 			return
 		}
+	}
+}
+
+// stepDownOnFatalCommitError releases leadership after the commit loop has
+// exited due to a fatal WAL/Pebble error. Without this, the node remains the
+// cluster's elected leader (watchLoop keeps LastSeenNano fresh, peer server
+// keeps the port bound) even though it can no longer accept writes —
+// followers cannot win TakeOver and the cluster stalls. Stepping down here
+// stops the lock-refresh polling and tears down the peer server so followers
+// notice the failure and proceed to election via the standard liveness-TTL
+// path.
+//
+// Idempotent with respect to Node.Close: cancelBg is a sync.Once-style
+// context cancel, and grpcSrv.Stop is documented as idempotent.
+func (n *Node) stepDownOnFatalCommitError() {
+	if n.loadRole() != roleLeader {
+		return
+	}
+	n.log.Warnf("t4: commit loop exited with fatal error — stepping down so followers can take over")
+	n.cancelBg()
+	n.mu.Lock()
+	grpcSrv := n.peerGRPC
+	n.mu.Unlock()
+	if grpcSrv != nil {
+		grpcSrv.Stop()
 	}
 }
 
