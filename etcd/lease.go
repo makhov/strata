@@ -2,56 +2,79 @@ package etcd
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/t4db/t4"
 )
 
 // LeaseGrant creates or reserves a lease ID with a real expiry time.
+//
+// The lease key is written with Node.Create so concurrent grants of the same
+// explicit ID are serialised by the leader's WAL: exactly one Create commits,
+// the rest return ErrKeyExists which surfaces as AlreadyExists.
 func (s *Server) LeaseGrant(ctx context.Context, r *etcdserverpb.LeaseGrantRequest) (*etcdserverpb.LeaseGrantResponse, error) {
 	if r.TTL <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "lease TTL must be positive")
 	}
 	id := r.ID
+
 	if id == 0 {
-		for {
-			var err error
-			id, err = newLeaseID()
+		const maxAttempts = 16
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			newID, err := newLeaseID()
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "generate lease ID: %v", err)
 			}
-			if _, err := s.getLease(ctx, id, true); status.Code(err) == codes.NotFound {
-				break
-			} else if err != nil {
+			rec := &leaseRecord{
+				ID:           newID,
+				GrantedTTL:   r.TTL,
+				ExpiryUnixNs: time.Now().Add(time.Duration(r.TTL) * time.Second).UnixNano(),
+			}
+			err = s.createLease(ctx, rec)
+			if err == nil {
+				return &etcdserverpb.LeaseGrantResponse{Header: s.header(), ID: rec.ID, TTL: rec.GrantedTTL}, nil
+			}
+			if status.Code(err) != codes.AlreadyExists {
 				return nil, err
 			}
 		}
-	} else {
-		if err := validateLeaseID(id); err != nil {
-			return nil, err
-		}
-		if _, err := s.getLease(ctx, id, true); err == nil {
-			return nil, status.Errorf(codes.AlreadyExists, "lease %d already exists", id)
-		} else if status.Code(err) != codes.NotFound {
-			return nil, err
-		}
+		return nil, status.Errorf(codes.Internal, "failed to allocate unique lease ID after %d attempts", maxAttempts)
 	}
 
+	if err := validateLeaseID(id); err != nil {
+		return nil, err
+	}
 	rec := &leaseRecord{
 		ID:           id,
 		GrantedTTL:   r.TTL,
 		ExpiryUnixNs: time.Now().Add(time.Duration(r.TTL) * time.Second).UnixNano(),
 	}
-	if err := s.putLease(ctx, rec); err != nil {
+	if err := s.createLease(ctx, rec); err != nil {
 		return nil, err
 	}
-	return &etcdserverpb.LeaseGrantResponse{
-		Header: s.header(),
-		ID:     rec.ID,
-		TTL:    rec.GrantedTTL,
-	}, nil
+	return &etcdserverpb.LeaseGrantResponse{Header: s.header(), ID: rec.ID, TTL: rec.GrantedTTL}, nil
+}
+
+// createLease writes a fresh lease record using an atomic create. It returns
+// AlreadyExists if another caller has already committed the key.
+func (s *Server) createLease(ctx context.Context, rec *leaseRecord) error {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return status.Errorf(codes.Internal, "marshal lease: %v", err)
+	}
+	if _, err := s.node.Create(ctx, leaseKey(rec.ID), data, 0); err != nil {
+		if errors.Is(err, t4.ErrKeyExists) {
+			return status.Errorf(codes.AlreadyExists, "lease %d already exists", rec.ID)
+		}
+		return status.Errorf(codes.Internal, "create lease: %v", err)
+	}
+	return nil
 }
 
 func (s *Server) LeaseRevoke(ctx context.Context, r *etcdserverpb.LeaseRevokeRequest) (*etcdserverpb.LeaseRevokeResponse, error) {
