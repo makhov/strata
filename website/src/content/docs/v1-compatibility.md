@@ -52,6 +52,7 @@ Default values are part of the v1 contract unless explicitly documented as tunin
 | `FollowerMaxRetries`  | 5                                              |
 | `FollowerWaitMode`    | `quorum`                                       |
 | `PeerBufferSize`      | 10,000                                         |
+| `WatchSendTimeout`    | 30 s                                           |
 
 Environment variables documented in [Configuration](configuration) remain supported across v1.x. Command-line flags take
 precedence over environment variables.

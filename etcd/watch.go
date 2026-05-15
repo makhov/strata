@@ -107,7 +107,7 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 
 			select {
 			case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: id, Created: true}:
-				go s.drainWatch(wctx, id, sub.progressNotify, sub.events, sub.match, sendCh)
+				go s.drainWatch(wctx, cancel, id, sub.progressNotify, sub.events, sub.match, sendCh)
 			case <-ctx.Done():
 				cancel()
 				return nil
@@ -162,9 +162,58 @@ func (s *Server) subscribeWatch(wctx context.Context, cr *etcdserverpb.WatchCrea
 	}, nil
 }
 
+// sendOrCancelSlow tries to enqueue resp on sendCh. It returns true on
+// success; on wctx cancellation it returns false; if the send blocks longer
+// than the configured WatchSendTimeout the watcher is treated as slow:
+//   - A `Canceled=true, CancelReason="mvcc: watcher is slow"` response is
+//     pushed to sendCh, best-effort within a second WatchSendTimeout window so
+//     it has a chance to land once the client (eventually) drains a slot. The
+//     cancel response is then "lost" only if buffers stay stuck for the full
+//     window.
+//   - false is returned. The caller MUST exit the per-watch goroutine.
+func (s *Server) sendOrCancelSlow(wctx context.Context, sendCh chan<- *etcdserverpb.WatchResponse, resp *etcdserverpb.WatchResponse, watchID int64) bool {
+	timeout := s.node.WatchSendTimeout()
+	if timeout <= 0 {
+		select {
+		case sendCh <- resp:
+			return true
+		case <-wctx.Done():
+			return false
+		}
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case sendCh <- resp:
+		return true
+	case <-wctx.Done():
+		return false
+	case <-timer.C:
+		cancel := &etcdserverpb.WatchResponse{
+			Header:       s.header(),
+			WatchId:      watchID,
+			Canceled:     true,
+			CancelReason: "mvcc: watcher is slow",
+		}
+		deliveryTimer := time.NewTimer(timeout)
+		defer deliveryTimer.Stop()
+		select {
+		case sendCh <- cancel:
+		case <-deliveryTimer.C:
+		case <-wctx.Done():
+		}
+		return false
+	}
+}
+
 // drainWatch reads events, coalesces them into a single WatchResponse per
 // burst, and forwards through sendCh until wctx is done or events closes.
-func (s *Server) drainWatch(wctx context.Context, watchID int64, progressNotify bool, events <-chan t4.Event, match func(string) bool, sendCh chan<- *etcdserverpb.WatchResponse) {
+//
+// wcancel is the per-watch context cancel; drainWatch calls it on exit so the
+// upstream Node.Watch goroutine (sitting on a blocked channel send) is
+// released along with this drain.
+func (s *Server) drainWatch(wctx context.Context, wcancel context.CancelFunc, watchID int64, progressNotify bool, events <-chan t4.Event, match func(string) bool, sendCh chan<- *etcdserverpb.WatchResponse) {
+	defer wcancel()
 	var progressC <-chan time.Time
 	if progressNotify {
 		t := time.NewTicker(time.Second)
@@ -192,12 +241,7 @@ func (s *Server) drainWatch(wctx context.Context, watchID int64, progressNotify 
 		batch = make([]*mvccpb.Event, 0, watchMaxBatch)
 		progressRev = batchMaxRev
 		batchMaxRev = 0
-		select {
-		case sendCh <- resp:
-			return true
-		case <-wctx.Done():
-			return false
-		}
+		return s.sendOrCancelSlow(wctx, sendCh, resp, watchID)
 	}
 	appendEvent := func(e t4.Event) {
 		// Track every observed revision, even ones we filter out, so the
@@ -248,9 +292,7 @@ func (s *Server) drainWatch(wctx context.Context, watchID int64, progressNotify 
 			// Pin the progress notification to the rev we have actually
 			// delivered. Claiming a higher rev would let apiserver advance
 			// its watchCache past undelivered events.
-			select {
-			case sendCh <- &etcdserverpb.WatchResponse{Header: s.headerAt(progressRev), WatchId: watchID}:
-			case <-wctx.Done():
+			if !s.sendOrCancelSlow(wctx, sendCh, &etcdserverpb.WatchResponse{Header: s.headerAt(progressRev), WatchId: watchID}, watchID) {
 				return
 			}
 		case <-wctx.Done():

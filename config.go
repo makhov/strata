@@ -180,6 +180,14 @@ type Config struct {
 	// follower catch-up. Default: 10 000.
 	PeerBufferSize int
 
+	// WatchSendTimeout is the maximum time the etcd Watch surface waits for
+	// a single WatchResponse to enter the per-stream send buffer before the
+	// watch is considered slow and canceled. On cancellation the server
+	// best-effort sends `Canceled=true, CancelReason="mvcc: watcher is
+	// slow"` and releases the per-watch goroutine; other watches on the
+	// same stream are unaffected. Default: 30 s.
+	WatchSendTimeout time.Duration
+
 	// PeerServerTLS is the transport credentials used by the leader's peer
 	// gRPC server. Nil means plaintext (only safe inside a trusted network).
 	PeerServerTLS credentials.TransportCredentials
@@ -259,6 +267,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.PeerBufferSize == 0 {
 		c.PeerBufferSize = 10_000
+	}
+	if c.WatchSendTimeout == 0 {
+		c.WatchSendTimeout = 30 * time.Second
 	}
 	if c.Logger == nil {
 		c.Logger = defaultLogger()

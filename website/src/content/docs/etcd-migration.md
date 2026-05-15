@@ -171,3 +171,27 @@ Key API differences from the etcd v3 Go client:
 | `MemberAdd` / `MemberRemove` / `MemberUpdate` / `MemberPromote` | Not supported                                 | Not needed for standard clients               |
 | etcd v2 API                                                     | Not supported                                 | Migrate to v3 first                           |
 | gRPC gateway (HTTP/JSON)                                        | Not included                                  | Use a gRPC proxy (e.g. grpc-gateway) in front |
+
+## Slow watcher cancellation
+
+If a watch's server-side send queue stays blocked for longer than
+`WatchSendTimeout` (default 30 s), the server cancels that watch and
+best-effort sends:
+
+```text
+WatchResponse{Canceled: true, CancelReason: "mvcc: watcher is slow"}
+```
+
+The per-watch goroutine and its upstream history scan are released. Other
+watches on the same stream are unaffected.
+
+Clients should treat this exactly like any other watch cancellation: open a
+fresh watch from the last revision they observed. If the gRPC stream itself is
+also stalled (the cancel response cannot drain), the cancellation response may
+be dropped — clients must still recover via the usual `Watch` re-create path
+when their stream times out.
+
+Embedders that need the legacy "block forever" behaviour can set
+`WatchSendTimeout` to a negative value when opening the node; this trades
+back-pressure on the WAL apply path against unbounded server memory growth and
+should not be used in production.

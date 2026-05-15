@@ -203,6 +203,7 @@ metadata.
 | `t4 run` | `T4_SEGMENT_MAX_SIZE_MB` | `--segment-max-size-mb` |
 | `t4 run` | `T4_TOKEN_TTL` | `--token-ttl` |
 | `t4 run` | `T4_WAL_SYNC_UPLOAD` | `--wal-sync-upload` |
+| `t4 run` | `T4_WATCH_SEND_TIMEOUT` | `--watch-send-timeout` |
 | `t4 status` | `T4_S3_ACCESS_KEY_ID` | `--s3-access-key-id` |
 | `t4 status` | `T4_S3_BUCKET` | `--s3-bucket` |
 | `t4 status` | `T4_S3_ENDPOINT` | `--s3-endpoint` |
@@ -316,6 +317,7 @@ Generated from the CLI flag definitions in Go. Run `go run ./hack/docgen` after 
 | `t4 run` | `--segment-max-size-mb` | `50` | `T4_SEGMENT_MAX_SIZE_MB` | No | WAL segment rotation size threshold in MiB |
 | `t4 run` | `--token-ttl` | `300` | `T4_TOKEN_TTL` | No | bearer token TTL in seconds |
 | `t4 run` | `--wal-sync-upload` | — | `T4_WAL_SYNC_UPLOAD` | No | upload WAL segments synchronously before ack (true/false; default true for safety, set false when local storage is durable) |
+| `t4 run` | `--watch-send-timeout` | `30s` | `T4_WATCH_SEND_TIMEOUT` | No | cancel a watch whose server-side send queue blocks for longer than this; clients receive a 'mvcc: watcher is slow' cancellation when possible |
 | `t4 status` | `--s3-access-key-id` | — | `T4_S3_ACCESS_KEY_ID` | No | t4 S3 access key ID; when set with --s3-secret-access-key, uses static credentials |
 | `t4 status` | `--s3-bucket` | — | `T4_S3_BUCKET` | Yes | S3 bucket |
 | `t4 status` | `--s3-endpoint` | — | `T4_S3_ENDPOINT` | No | custom S3 endpoint URL, e.g. for MinIO |

@@ -45,6 +45,7 @@ func runCmd() *cobra.Command {
 		leaderWatchIntervalSec int
 		followerMaxRetries     int
 		followerWaitMode       string
+		watchSendTimeout       time.Duration
 		// peer mTLS
 		peerTLSCA   string
 		peerTLSCert string
@@ -123,6 +124,7 @@ func runCmd() *cobra.Command {
 				LeaderWatchInterval: time.Duration(leaderWatchIntervalSec) * time.Second,
 				FollowerMaxRetries:  followerMaxRetries,
 				FollowerWaitMode:    t4.FollowerWaitMode(followerWaitMode),
+				WatchSendTimeout:    watchSendTimeout,
 			}
 
 			if walSyncUpload != "" {
@@ -273,6 +275,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().IntVar(&leaderWatchIntervalSec, "leader-watch-interval-sec", 300, "how often (seconds) the leader reads the lock to detect supersession (env: T4_LEADER_WATCH_INTERVAL_SEC)")
 	cmd.Flags().IntVar(&followerMaxRetries, "follower-max-retries", 5, "consecutive stream failures before a follower attempts a leader takeover (env: T4_FOLLOWER_MAX_RETRIES)")
 	cmd.Flags().StringVar(&followerWaitMode, "follower-wait-mode", "quorum", "leader wait policy for follower ACKs before commit: none, quorum, or all (env: T4_FOLLOWER_WAIT_MODE)")
+	cmd.Flags().DurationVar(&watchSendTimeout, "watch-send-timeout", 30*time.Second, "cancel a watch whose server-side send queue blocks for longer than this; clients receive a 'mvcc: watcher is slow' cancellation when possible (env: T4_WATCH_SEND_TIMEOUT)")
 	// peer mTLS
 	cmd.Flags().StringVar(&peerTLSCA, "peer-tls-ca", "", "CA certificate file for peer mTLS (PEM) (env: T4_PEER_TLS_CA)")
 	cmd.Flags().StringVar(&peerTLSCert, "peer-tls-cert", "", "node certificate file for peer mTLS (PEM) (env: T4_PEER_TLS_CERT)")
@@ -312,6 +315,7 @@ func runCmd() *cobra.Command {
 			"advertise-peer":                       "T4_ADVERTISE_PEER",
 			"leader-watch-interval-sec":            "T4_LEADER_WATCH_INTERVAL_SEC",
 			"follower-max-retries":                 "T4_FOLLOWER_MAX_RETRIES",
+			"watch-send-timeout":                   "T4_WATCH_SEND_TIMEOUT",
 			"follower-wait-mode":                   "T4_FOLLOWER_WAIT_MODE",
 			"peer-tls-ca":                          "T4_PEER_TLS_CA",
 			"peer-tls-cert":                        "T4_PEER_TLS_CERT",

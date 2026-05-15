@@ -781,6 +781,10 @@ func (n *Node) Close() error {
 // ReadConsistency returns the configured read consistency mode.
 func (n *Node) ReadConsistency() ReadConsistency { return n.cfg.ReadConsistency }
 
+// WatchSendTimeout returns the configured per-watch send timeout used by the
+// etcd Watch adapter to detect slow watchers. See Config.WatchSendTimeout.
+func (n *Node) WatchSendTimeout() time.Duration { return n.cfg.WatchSendTimeout }
+
 // syncWithLeader implements the ReadIndex pattern: ask the leader for its
 // current revision, then wait until this node has applied at least that far.
 // Returns nil immediately if the node is the leader or running single-node.
