@@ -8,6 +8,10 @@ on:
 jobs:
   jepsen:
     uses: ./.github/workflows/jepsen-workflow.yml
+    # Nightly runs the full nemesis matrix. Per-PR runs use a smaller smoke
+    # matrix (see jepsen.yml).
+    with:
+      nemeses: '["partition-halves", "kill", "partition-minio"]'
 
   stress:
     name: Stress (30m)

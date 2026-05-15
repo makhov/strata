@@ -7,10 +7,12 @@ on:
     branches:
       - main
   pull_request:
-    paths:
-      - "jepsen/**"
   workflow_dispatch:
 
 jobs:
   jepsen:
     uses: ./.github/workflows/jepsen-workflow.yml
+    # PR / branch pushes run a small smoke matrix so iteration on jepsen/**
+    # stays fast. The full nemesis matrix runs nightly (see nightly.yml).
+    with:
+      nemeses: '["partition-halves"]'

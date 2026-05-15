@@ -2,6 +2,12 @@ name: Jepsen (reusable)
 
 on:
   workflow_call:
+    inputs:
+      nemeses:
+        description: 'JSON-encoded list of nemeses to run, e.g. ["partition-halves"]. Defaults to the full set.'
+        type: string
+        required: false
+        default: '["partition-halves", "kill", "partition-minio"]'
 
 jobs:
   jepsen:
@@ -11,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        nemesis: [partition-halves, kill, partition-minio]
+        nemesis: ${{ fromJSON(inputs.nemeses) }}
 
     steps:
       - uses: actions/checkout@v4
