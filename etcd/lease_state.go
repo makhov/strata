@@ -118,11 +118,6 @@ func (s *Server) putLease(ctx context.Context, rec *leaseRecord) error {
 	return nil
 }
 
-func (s *Server) deleteLeaseRecord(ctx context.Context, id int64) error {
-	_, err := s.node.Delete(ctx, leaseKey(id))
-	return err
-}
-
 func (s *Server) listLeases(ctx context.Context, linearizable bool) ([]*leaseRecord, error) {
 	var (
 		kvs []*t4.KeyValue
@@ -193,24 +188,29 @@ func (s *Server) collectLeaseKeys(ctx context.Context, leaseID int64, linearizab
 	return keys, nil
 }
 
+// revokeLease deletes every key attached to leaseID and the lease record
+// itself in a single atomic transaction. Crash-safety: either every delete
+// commits to the WAL together or none of them do, so a leader crash during
+// revoke can never leave a "half-revoked" lease (record present but attached
+// keys missing, or vice versa).
+//
+// Note: there is still a small race between collectLeaseKeys and the Txn
+// where a concurrent Put attaching a new key to leaseID could land. Etcd has
+// the same race; v1 accepts it.
 func (s *Server) revokeLease(ctx context.Context, leaseID int64) error {
 	keys, err := s.collectLeaseKeys(ctx, leaseID, true)
 	if err != nil {
 		return err
 	}
+	ops := make([]t4.TxnOp, 0, len(keys)+1)
 	for _, key := range keys {
-		if _, err := s.node.Delete(ctx, key); err != nil && !statusIsNotFound(err) {
-			return err
-		}
+		ops = append(ops, t4.TxnOp{Type: t4.TxnDelete, Key: key})
 	}
-	if err := s.deleteLeaseRecord(ctx, leaseID); err != nil && !statusIsNotFound(err) {
+	ops = append(ops, t4.TxnOp{Type: t4.TxnDelete, Key: leaseKey(leaseID)})
+	if _, err := s.node.Txn(ctx, t4.TxnRequest{Success: ops}); err != nil {
 		return err
 	}
 	return nil
-}
-
-func statusIsNotFound(err error) bool {
-	return status.Code(err) == codes.NotFound
 }
 
 func (s *Server) maybeStartLeaseLoop() {
