@@ -3,11 +3,14 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -18,6 +21,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -83,7 +87,13 @@ func TestMinIOCLISmoke(t *testing.T) {
 		t.Fatalf("unexpected restored count %q", strings.TrimSpace(out))
 	}
 
-	branchArgs := append([]string{"branch", "fork", "--branch-id", "smoke-branch"}, s3Args(cfg)...)
+	s3cli, err := s3Client(ctx, cfg)
+	if err != nil {
+		t.Fatalf("s3 client: %v", err)
+	}
+
+	const branchID = "smoke-branch"
+	branchArgs := append([]string{"branch", "fork", "--branch-id", branchID}, s3Args(cfg)...)
 	branchOut, err := runT4(ctx, cfg, branchArgs...)
 	if err != nil {
 		t.Fatalf("branch fork: %v\n%s", err, branchOut)
@@ -93,6 +103,37 @@ func TestMinIOCLISmoke(t *testing.T) {
 		t.Fatalf("unexpected branch checkpoint key %q from output:\n%s", branchKey, branchOut)
 	}
 
+	// Branch registry entry must exist after fork.
+	registryKey := "branches/" + branchID
+	if ok, err := s3KeyExists(ctx, s3cli, cfg, registryKey); err != nil {
+		t.Fatalf("HEAD %s after fork: %v", registryKey, err)
+	} else if !ok {
+		t.Fatalf("branch registry key %s missing after fork", registryKey)
+	}
+
+	// Capture the SSTs the pinned checkpoint depends on so we can verify
+	// none are deleted by GC while the branch is active.
+	pinnedSSTs, err := checkpointSSTs(ctx, s3cli, cfg, branchKey)
+	if err != nil {
+		t.Fatalf("read pinned checkpoint manifest %s: %v", branchKey, err)
+	}
+	if len(pinnedSSTs) == 0 {
+		t.Fatalf("pinned checkpoint %s lists no SSTs; nothing to protect", branchKey)
+	}
+	t.Logf("branch pinned checkpoint %s protects %d SST(s)", branchKey, len(pinnedSSTs))
+
+	// Write more data so a newer checkpoint is uploaded, leaving branchKey
+	// as an older (only-reachable-through-the-branch) checkpoint. Without
+	// this step, GC --keep 1 would retain branchKey purely because it is
+	// the latest checkpoint, masking the branch-pinning behavior we want
+	// to assert here.
+	if err := writeMoreData(ctx, listenAddr); err != nil {
+		t.Fatalf("post-fork write: %v\nnode log:\n%s", err, nodeLog.String())
+	}
+	if _, err := waitForRestoredCount(ctx, cfg, workDir, "/smoke-post/", 3); err != nil {
+		t.Fatalf("wait for newer checkpoint: %v", err)
+	}
+
 	gcArgs := append([]string{"gc", "--keep", "1"}, s3Args(cfg)...)
 	if out, err := runT4(ctx, cfg, gcArgs...); err != nil {
 		t.Fatalf("gc with pinned branch: %v\n%s", err, out)
@@ -100,14 +141,151 @@ func TestMinIOCLISmoke(t *testing.T) {
 		t.Fatalf("gc output missing success text:\n%s", out)
 	}
 
-	unforkArgs := append([]string{"branch", "unfork", "--branch-id", "smoke-branch"}, s3Args(cfg)...)
+	// While the branch is pinned, GC must not delete the registry entry,
+	// the pinned checkpoint, or any of its SSTs.
+	if ok, err := s3KeyExists(ctx, s3cli, cfg, registryKey); err != nil {
+		t.Fatalf("HEAD %s after pinned gc: %v", registryKey, err)
+	} else if !ok {
+		t.Fatalf("GC deleted branch registry key %s while branch was pinned", registryKey)
+	}
+	if ok, err := s3KeyExists(ctx, s3cli, cfg, branchKey); err != nil {
+		t.Fatalf("HEAD %s after pinned gc: %v", branchKey, err)
+	} else if !ok {
+		t.Fatalf("GC deleted pinned checkpoint %s", branchKey)
+	}
+	for _, sst := range pinnedSSTs {
+		if ok, err := s3KeyExists(ctx, s3cli, cfg, sst); err != nil {
+			t.Fatalf("HEAD %s after pinned gc: %v", sst, err)
+		} else if !ok {
+			t.Fatalf("GC deleted branch-pinned SST %s", sst)
+		}
+	}
+
+	unforkArgs := append([]string{"branch", "unfork", "--branch-id", branchID}, s3Args(cfg)...)
 	if out, err := runT4(ctx, cfg, unforkArgs...); err != nil {
 		t.Fatalf("branch unfork: %v\n%s", err, out)
+	}
+
+	// Unfork must remove the registry entry.
+	if ok, err := s3KeyExists(ctx, s3cli, cfg, registryKey); err != nil {
+		t.Fatalf("HEAD %s after unfork: %v", registryKey, err)
+	} else if ok {
+		t.Fatalf("branch registry key %s still present after unfork", registryKey)
 	}
 
 	if out, err := runT4(ctx, cfg, gcArgs...); err != nil {
 		t.Fatalf("gc after unfork: %v\n%s", err, out)
 	}
+
+	// After unfork + gc the pinned checkpoint must be reclaimable. Any SST
+	// that is ONLY referenced by that checkpoint (i.e. not by the latest
+	// checkpoint that --keep=1 retains) must be reclaimed as well.
+	if ok, err := s3KeyExists(ctx, s3cli, cfg, branchKey); err != nil {
+		t.Fatalf("HEAD %s after unfork gc: %v", branchKey, err)
+	} else if ok {
+		t.Fatalf("GC did not reclaim unforked checkpoint %s", branchKey)
+	}
+	survivingSSTs, err := latestCheckpointSSTs(ctx, s3cli, cfg)
+	if err != nil {
+		t.Fatalf("read latest checkpoint manifest: %v", err)
+	}
+	stillNeeded := make(map[string]struct{}, len(survivingSSTs))
+	for _, k := range survivingSSTs {
+		stillNeeded[k] = struct{}{}
+	}
+	for _, sst := range pinnedSSTs {
+		if _, shared := stillNeeded[sst]; shared {
+			continue
+		}
+		if ok, err := s3KeyExists(ctx, s3cli, cfg, sst); err != nil {
+			t.Fatalf("HEAD %s after unfork gc: %v", sst, err)
+		} else if ok {
+			t.Fatalf("GC did not reclaim orphan SST %s after unfork", sst)
+		}
+	}
+}
+
+// s3KeyExists reports whether the object at the prefix-relative key exists in
+// the test bucket. Returns false (no error) when the object is absent.
+func s3KeyExists(ctx context.Context, client *s3.Client, cfg minioConfig, relKey string) (bool, error) {
+	_, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(cfg.bucket),
+		Key:    aws.String(prefixedKey(cfg, relKey)),
+	})
+	if err == nil {
+		return true, nil
+	}
+	if isS3NotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// s3GetObject downloads and returns the body of a prefix-relative object key.
+func s3GetObject(ctx context.Context, client *s3.Client, cfg minioConfig, relKey string) ([]byte, error) {
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(cfg.bucket),
+		Key:    aws.String(prefixedKey(cfg, relKey)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return io.ReadAll(resp.Body)
+}
+
+// checkpointSSTs reads the checkpoint manifest at relKey and returns the union
+// of its own_store and ancestor_store SST keys (prefix-relative).
+func checkpointSSTs(ctx context.Context, client *s3.Client, cfg minioConfig, relKey string) ([]string, error) {
+	body, err := s3GetObject(ctx, client, cfg, relKey)
+	if err != nil {
+		return nil, err
+	}
+	var m struct {
+		SSTFiles         []string `json:"sst_files"`
+		AncestorSSTFiles []string `json:"ancestor_sst_files"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("decode checkpoint manifest: %w", err)
+	}
+	out := make([]string, 0, len(m.SSTFiles)+len(m.AncestorSSTFiles))
+	out = append(out, m.SSTFiles...)
+	out = append(out, m.AncestorSSTFiles...)
+	return out, nil
+}
+
+// latestCheckpointSSTs returns the SST keys referenced by the current
+// manifest/latest pointer's checkpoint.
+func latestCheckpointSSTs(ctx context.Context, client *s3.Client, cfg minioConfig) ([]string, error) {
+	body, err := s3GetObject(ctx, client, cfg, "manifest/latest")
+	if err != nil {
+		return nil, err
+	}
+	var m struct {
+		CheckpointKey string `json:"checkpoint_key"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("decode manifest/latest: %w", err)
+	}
+	if m.CheckpointKey == "" {
+		return nil, fmt.Errorf("manifest/latest has empty checkpoint_key")
+	}
+	return checkpointSSTs(ctx, client, cfg, m.CheckpointKey)
+}
+
+func prefixedKey(cfg minioConfig, relKey string) string {
+	if cfg.prefix == "" {
+		return relKey
+	}
+	return path.Join(cfg.prefix, relKey)
+}
+
+func isS3NotFound(err error) bool {
+	var apiErr *smithyhttp.ResponseError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatusCode() == 404
+	}
+	return false
 }
 
 func buildT4(t *testing.T, ctx context.Context, workDir string) string {
@@ -186,6 +364,14 @@ func startNode(t *testing.T, ctx context.Context, cfg minioConfig, dataDir, list
 }
 
 func writeData(ctx context.Context, listenAddr string) error {
+	return writeKeysWithPrefix(ctx, listenAddr, "/smoke/", 3)
+}
+
+func writeMoreData(ctx context.Context, listenAddr string) error {
+	return writeKeysWithPrefix(ctx, listenAddr, "/smoke-post/", 3)
+}
+
+func writeKeysWithPrefix(ctx context.Context, listenAddr, prefix string, n int) error {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{listenAddr},
 		DialTimeout: 2 * time.Second,
@@ -194,9 +380,8 @@ func writeData(ctx context.Context, listenAddr string) error {
 		return err
 	}
 	defer func() { _ = cli.Close() }()
-	for i := 0; i < 3; i++ {
-		_, err := cli.Put(ctx, fmt.Sprintf("/smoke/%d", i), fmt.Sprintf("value-%d", i))
-		if err != nil {
+	for i := 0; i < n; i++ {
+		if _, err := cli.Put(ctx, fmt.Sprintf("%s%d", prefix, i), fmt.Sprintf("value-%d", i)); err != nil {
 			return err
 		}
 	}
