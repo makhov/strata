@@ -57,6 +57,48 @@ Reads are served from the local Pebble state without contacting the leader.
 
 ---
 
+## Linearizability claim and Jepsen evidence
+
+T4 claims **linearizability** for the following operations, with `ReadConsistency: linearizable` (default):
+
+- Single-key `Put`, `Get`, `Delete`.
+- Multi-key `Txn` (`If` / `Then` / `Else`) under the same revision-assignment lock as single-key writes. All ops in a transaction commit to the WAL in one entry and apply to Pebble in one batch.
+- Watch events: the sequence of events delivered to a single watcher is ordered by revision, and revisions never repeat or regress across leader failover.
+
+The claim is **not** that every read is linearizable regardless of configuration. The following are not linearizable:
+
+- Reads taken with `ReadConsistency: serializable` (consistent prefix, but may be stale relative to the leader's current revision).
+- Reads served by a follower whose stream is currently disconnected from the leader during a partition (the follower returns `ErrNotLeader` for linearizable reads rather than serving stale data).
+- Lease TTL clocks (wall-clock dependent; see [`api`](api) and the upgrade implications in [`v1-compatibility`](v1-compatibility)).
+
+### Jepsen evidence
+
+The continuous evidence for the linearizability claim is the [Jepsen test suite](https://github.com/t4db/t4/tree/main/jepsen) (`jepsen/src/jepsen/t4/`).
+
+Two workloads, both defined in [`jepsen/src/jepsen/t4/core.clj`](https://github.com/t4db/t4/blob/main/jepsen/src/jepsen/t4/core.clj):
+
+- **`register`** — single-key CAS register (50% reads / 30% writes / 20% CAS). Knossos `cas-register` model.
+- **`multi-register`** — three keys driven through the etcd `Txn` API. Every write and CAS is a single Txn covering all three keys, committed in one WAL entry (one revision). The three-tuple `{:a v :b v :c v}` is modelled as a single `cas-register` value, so any non-atomic application would surface as a linearizability violation.
+
+Nemeses (the same for both workloads):
+
+- `partition-halves` (random 2/3 split).
+- `kill` (kill+restart a random node).
+- `partition-minio` (isolate a node from S3 via iptables).
+
+Every PR that touches `jepsen/**` runs the smoke matrix (`partition-halves` × both workloads). The nightly workflow runs the full matrix (every nemesis × both workloads = 6 jobs). A release tag must cite the most recent green nightly Jepsen run — see [Releasing T4](releasing).
+
+### What Jepsen does not prove (today)
+
+These are real properties of T4, but no Jepsen workload directly exercises them. They are covered by Go tests in this repo. Treat them as **claimed but Jepsen-untested**:
+
+- Watch ordering and replay across leader failover.
+- Lease keepalive / revoke under partition.
+
+Filing new Jepsen workloads for these is a v1.x follow-up.
+
+---
+
 ## CAP classification
 
 T4 is a **CP system** (Consistent + Partition-tolerant) in cluster mode:
@@ -127,3 +169,5 @@ Leader identity is stored as a record in S3 with an ETag-based conditional updat
 - [Configuration reference](configuration) — `ReadConsistency`, `FollowerWaitMode`, `WALSyncUpload`
 - [Architecture](architecture) — CAP properties, follower replication, concurrency model
 - [Operations guide](operations) — Durability and recovery, network partitions
+- [Releasing T4](releasing) — release notes must cite the last green nightly Jepsen run
+- [Jepsen suite source](https://github.com/t4db/t4/tree/main/jepsen)

@@ -108,8 +108,48 @@
                (repeat 2 (fn [] {:type :invoke :f :cas
                                  :value [(rand-int 10) (rand-int 10)]}))])})
 
+(defn- rand-multi-values
+  "Returns a {:a v :b v :c v} map of fresh random small integers — the value
+  space the multi-register workload writes and CASes against."
+  []
+  {:a (rand-int 5) :b (rand-int 5) :c (rand-int 5)})
+
+;; Initial state of the multi-register: every key absent. cas-register's
+;; default initial value is nil, which would mismatch the {:a nil :b nil
+;; :c nil} map that the client returns before any write — so we seed the
+;; model with the absent-everything map explicitly.
+(def ^:private multi-register-init
+  {:a nil :b nil :c nil})
+
+(defn multi-register-workload
+  "Multi-key CAS-register workload: exercises etcd Txn with three keys.
+
+  The whole {:a v :b v :c v} map is treated as one register value; the model
+  is knossos.model/cas-register over that map. T4's multi-key Txn writes all
+  three keys in a single WAL entry (one revision), so the 3-tuple either
+  moves to the new map or stays at the old one — exactly the semantics
+  cas-register models. Per-key linearizability is therefore implied: there
+  is no schedule in which one key's value moves without the others moving
+  to the same revision."
+  []
+  {:client  (client/multi-register-client)
+   :checker (checker/compose
+              {:linearizable (checker/linearizable
+                               {:model     (model/cas-register multi-register-init)
+                                :algorithm :linear})
+               :timeline     (timeline/html)
+               :perf         (checker/perf)})
+   :gen     (gen/mix
+              [(repeat 5 {:type :invoke :f :read :value nil})
+               (repeat 3 (fn [] {:type :invoke :f :write
+                                 :value (rand-multi-values)}))
+               (repeat 2 (fn [] {:type :invoke :f :cas
+                                 :value [(rand-multi-values)
+                                         (rand-multi-values)]}))])})
+
 (def workloads
-  {:register register-workload})
+  {:register       register-workload
+   :multi-register multi-register-workload})
 
 ;; ── Test constructor ──────────────────────────────────────────────────────────
 
@@ -149,7 +189,7 @@
 (def cli-opts
   "Extra CLI options beyond Jepsen's defaults."
   [[nil "--workload NAME"
-    "Workload to run: register (default)"
+    "Workload to run: register (default) | multi-register"
     :default :register
     :parse-fn keyword]
    [nil "--nemesis NAME"
