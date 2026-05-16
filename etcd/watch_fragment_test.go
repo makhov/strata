@@ -115,7 +115,7 @@ func TestSendEventsFragmentFlag(t *testing.T) {
 		t.Fatalf("test setup: expected >1 chunks for budget=%d, got %d", watchFragmentBytes, len(chunks))
 	}
 
-	sendCh := make(chan *etcdserverpb.WatchResponse, 16)
+	sendCh := make(chan []*etcdserverpb.WatchResponse, 16)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -124,9 +124,11 @@ func TestSendEventsFragmentFlag(t *testing.T) {
 	}
 	close(sendCh)
 
+	// One atomic run carrying the whole fragment sequence — the contract
+	// the sender goroutine relies on for contiguous transmission.
 	var received []*etcdserverpb.WatchResponse
-	for r := range sendCh {
-		received = append(received, r)
+	for run := range sendCh {
+		received = append(received, run...)
 	}
 	if len(received) != len(chunks) {
 		t.Fatalf("frames: got %d, want %d", len(received), len(chunks))

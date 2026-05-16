@@ -29,7 +29,7 @@ func TestDrainWatchSlowWatcherCancellation(t *testing.T) {
 	srv := New(node, nil, nil)
 
 	events := make(chan t4.Event, 4)
-	sendCh := make(chan *etcdserverpb.WatchResponse) // unbuffered: every flush blocks until consumed
+	sendCh := make(chan []*etcdserverpb.WatchResponse) // unbuffered: every flush blocks until consumed
 
 	wctx, wcancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -47,15 +47,19 @@ func TestDrainWatchSlowWatcherCancellation(t *testing.T) {
 	// past the trip point.
 	time.Sleep(350 * time.Millisecond)
 
-	// drainWatch is now in the cancel-delivery window. The first response
-	// it pushes through sendCh MUST be the cancellation, not the abandoned
-	// event flush.
-	var resp *etcdserverpb.WatchResponse
+	// drainWatch is now in the cancel-delivery window. The first run
+	// pushed through sendCh MUST contain the cancellation, not the
+	// abandoned event flush.
+	var run []*etcdserverpb.WatchResponse
 	select {
-	case resp = <-sendCh:
+	case run = <-sendCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("no response on sendCh after slow trip")
 	}
+	if len(run) != 1 {
+		t.Fatalf("expected single-frame cancel run, got %d frames", len(run))
+	}
+	resp := run[0]
 
 	if !resp.Canceled {
 		t.Fatalf("expected Canceled=true after slow trip, got %+v", resp)
@@ -95,7 +99,7 @@ func TestDrainWatchTimeoutDisabled(t *testing.T) {
 	srv := New(node, nil, nil)
 
 	events := make(chan t4.Event, 4)
-	sendCh := make(chan *etcdserverpb.WatchResponse) // unbuffered
+	sendCh := make(chan []*etcdserverpb.WatchResponse) // unbuffered
 
 	wctx, wcancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
