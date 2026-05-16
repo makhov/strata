@@ -20,6 +20,18 @@ import (
 // hundreds of events here.
 const watchMaxBatch = 64
 
+// Maximum approximate proto size of a single WatchResponse fragment. When a
+// client opts in to fragmentation (WatchCreateRequest.Fragment=true) and a
+// flush would exceed this, the batch is split into multiple WatchResponses
+// — all but the last carry Fragment=true. Picked well below clientv3's
+// default 4 MiB max-recv so clients with smaller limits also fit. Not part
+// of the v1 contract; the only requirement is that fragments be small
+// enough for the client.
+//
+// Declared as var (not const) so unit tests can shrink the budget to exercise
+// the fragment branch without generating multi-MB payloads.
+var watchFragmentBytes = 1 << 20 // 1 MiB
+
 // Watch implements WatchServer.Watch (bidirectional streaming).
 //
 // One stream multiplexes many watches. gRPC requires that Send on a stream is
@@ -107,7 +119,7 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 
 			select {
 			case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: id, Created: true}:
-				go s.drainWatch(wctx, cancel, id, sub.progressNotify, sub.events, sub.match, sendCh)
+				go s.drainWatch(wctx, cancel, id, sub.progressNotify, sub.fragment, sub.events, sub.match, sendCh)
 			case <-ctx.Done():
 				cancel()
 				return nil
@@ -140,6 +152,7 @@ type watchSubscription struct {
 	events         <-chan t4.Event
 	match          func(string) bool
 	progressNotify bool
+	fragment       bool
 }
 
 // subscribeWatch subscribes to t4.Node.Watch synchronously. Subscribe errors
@@ -159,7 +172,96 @@ func (s *Server) subscribeWatch(wctx context.Context, cr *etcdserverpb.WatchCrea
 		events:         events,
 		match:          match,
 		progressNotify: cr.ProgressNotify,
+		fragment:       cr.Fragment,
 	}, nil
+}
+
+// sendEvents emits a batch of events as one or more WatchResponse frames
+// through sendCh.
+//
+// When fragment is false or the batch fits in a single frame, one frame is
+// sent. When fragment is true and the estimated proto size exceeds
+// watchFragmentBytes, the batch is greedily partitioned into fragments;
+// every fragment shares Header.Revision = rev and WatchId, and all but the
+// last carry Fragment=true. clientv3 buffers the run until Fragment=false
+// and then surfaces one combined WatchResponse.
+//
+// Returns false (and the caller must exit drainWatch) when sendOrCancelSlow
+// times out on any fragment.
+func (s *Server) sendEvents(wctx context.Context, sendCh chan<- *etcdserverpb.WatchResponse, watchID int64, batch []*mvccpb.Event, rev int64, fragment bool) bool {
+	header := s.headerAt(rev)
+	if !fragment || estimateEventsSize(batch) <= watchFragmentBytes {
+		return s.sendOrCancelSlow(wctx, sendCh, &etcdserverpb.WatchResponse{
+			Header:  header,
+			WatchId: watchID,
+			Events:  batch,
+		}, watchID)
+	}
+	chunks := splitEventsBySize(batch, watchFragmentBytes)
+	for i, chunk := range chunks {
+		resp := &etcdserverpb.WatchResponse{
+			Header:   header,
+			WatchId:  watchID,
+			Events:   chunk,
+			Fragment: i < len(chunks)-1,
+		}
+		if !s.sendOrCancelSlow(wctx, sendCh, resp, watchID) {
+			return false
+		}
+	}
+	return true
+}
+
+// estimateEventSize returns a cheap upper-bound estimate of the proto-encoded
+// size of one mvccpb.Event. The exact size depends on protobuf framing, but
+// for a fragmentation budget the dominant terms (key + value bytes) are
+// enough — a constant-per-event overhead absorbs framing.
+func estimateEventSize(e *mvccpb.Event) int {
+	if e == nil {
+		return 0
+	}
+	const perEventOverhead = 32 // type tag + length prefixes + framing
+	const perKVOverhead = 48    // KeyValue struct's tagged fields
+	size := perEventOverhead
+	if e.Kv != nil {
+		size += perKVOverhead + len(e.Kv.Key) + len(e.Kv.Value)
+	}
+	if e.PrevKv != nil {
+		size += perKVOverhead + len(e.PrevKv.Key) + len(e.PrevKv.Value)
+	}
+	return size
+}
+
+func estimateEventsSize(events []*mvccpb.Event) int {
+	total := 0
+	for _, e := range events {
+		total += estimateEventSize(e)
+	}
+	return total
+}
+
+// splitEventsBySize greedy-partitions events into chunks of at most maxBytes
+// estimated size. A single event larger than maxBytes is its own chunk
+// (sending it alone is the best we can do — gRPC max-send is large enough to
+// hold any one event under the request-size limit).
+func splitEventsBySize(events []*mvccpb.Event, maxBytes int) [][]*mvccpb.Event {
+	var chunks [][]*mvccpb.Event
+	var current []*mvccpb.Event
+	currentSize := 0
+	for _, e := range events {
+		size := estimateEventSize(e)
+		if currentSize > 0 && currentSize+size > maxBytes {
+			chunks = append(chunks, current)
+			current = nil
+			currentSize = 0
+		}
+		current = append(current, e)
+		currentSize += size
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks
 }
 
 // sendOrCancelSlow tries to enqueue resp on sendCh. It returns true on
@@ -212,7 +314,11 @@ func (s *Server) sendOrCancelSlow(wctx context.Context, sendCh chan<- *etcdserve
 // wcancel is the per-watch context cancel; drainWatch calls it on exit so the
 // upstream Node.Watch goroutine (sitting on a blocked channel send) is
 // released along with this drain.
-func (s *Server) drainWatch(wctx context.Context, wcancel context.CancelFunc, watchID int64, progressNotify bool, events <-chan t4.Event, match func(string) bool, sendCh chan<- *etcdserverpb.WatchResponse) {
+//
+// fragment mirrors WatchCreateRequest.Fragment: when true and a flush would
+// exceed watchFragmentBytes, the batch is split into multiple WatchResponses
+// sharing the same Header.Revision; all but the last carry Fragment=true.
+func (s *Server) drainWatch(wctx context.Context, wcancel context.CancelFunc, watchID int64, progressNotify, fragment bool, events <-chan t4.Event, match func(string) bool, sendCh chan<- *etcdserverpb.WatchResponse) {
 	defer wcancel()
 	var progressC <-chan time.Time
 	if progressNotify {
@@ -233,15 +339,12 @@ func (s *Server) drainWatch(wctx context.Context, wcancel context.CancelFunc, wa
 		if len(batch) == 0 {
 			return true
 		}
-		resp := &etcdserverpb.WatchResponse{
-			Header:  s.headerAt(batchMaxRev),
-			WatchId: watchID,
-			Events:  batch,
-		}
+		toSend := batch
+		rev := batchMaxRev
 		batch = make([]*mvccpb.Event, 0, watchMaxBatch)
-		progressRev = batchMaxRev
+		progressRev = rev
 		batchMaxRev = 0
-		return s.sendOrCancelSlow(wctx, sendCh, resp, watchID)
+		return s.sendEvents(wctx, sendCh, watchID, toSend, rev, fragment)
 	}
 	appendEvent := func(e t4.Event) {
 		// Track every observed revision, even ones we filter out, so the

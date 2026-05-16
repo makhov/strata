@@ -34,7 +34,7 @@ func TestDrainWatchSlowWatcherCancellation(t *testing.T) {
 	wctx, wcancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		srv.drainWatch(wctx, wcancel, 42, false, events, func(string) bool { return true }, sendCh)
+		srv.drainWatch(wctx, wcancel, 42, false, false, events, func(string) bool { return true }, sendCh)
 		close(done)
 	}()
 
@@ -100,7 +100,7 @@ func TestDrainWatchTimeoutDisabled(t *testing.T) {
 	wctx, wcancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		srv.drainWatch(wctx, wcancel, 1, false, events, func(string) bool { return true }, sendCh)
+		srv.drainWatch(wctx, wcancel, 1, false, false, events, func(string) bool { return true }, sendCh)
 		close(done)
 	}()
 
