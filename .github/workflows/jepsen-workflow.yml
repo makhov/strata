@@ -8,16 +8,22 @@ on:
         type: string
         required: false
         default: '["partition-halves", "kill", "partition-minio"]'
+      workloads:
+        description: 'JSON-encoded list of workloads to run, e.g. ["register"]. Defaults to both.'
+        type: string
+        required: false
+        default: '["register", "multi-register"]'
 
 jobs:
   jepsen:
-    name: Jepsen (${{ matrix.nemesis }})
+    name: Jepsen (${{ matrix.workload }} / ${{ matrix.nemesis }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         nemesis: ${{ fromJSON(inputs.nemeses) }}
+        workload: ${{ fromJSON(inputs.workloads) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -37,14 +43,14 @@ jobs:
           docker compose -f jepsen/docker-compose.yml \
             wait minio-init || true
 
-      - name: Run Jepsen (${{ matrix.nemesis }}, 60 s)
+      - name: Run Jepsen (${{ matrix.workload }} / ${{ matrix.nemesis }}, 60 s)
         run: |
           docker compose -f jepsen/docker-compose.yml run --rm control \
             lein run -- test \
               --nodes        n1,n2,n3,n4,n5 \
               --username     root \
               --ssh-private-key /root/.ssh/id_ed25519 \
-              --workload     register \
+              --workload     ${{ matrix.workload }} \
               --nemesis      ${{ matrix.nemesis }} \
               --time-limit   60 \
               --concurrency  3
@@ -53,7 +59,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jepsen-store-${{ matrix.nemesis }}-${{ github.sha }}
+          name: jepsen-store-${{ matrix.workload }}-${{ matrix.nemesis }}-${{ github.sha }}
           path: jepsen/store/
           retention-days: 30
 

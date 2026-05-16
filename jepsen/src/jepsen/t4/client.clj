@@ -128,3 +128,114 @@
 
 (defn register-client []
   (map->RegisterClient {}))
+
+;; ── Multi-key register operations ─────────────────────────────────────────────
+;;
+;; Three keys hold small integers. Operations exercise the etcd Txn surface:
+;;
+;;   :read  → Txn(no compares, Then Get(a), Get(b), Get(c)) → {:a v :b v :c v}
+;;   :write {:a v :b v :c v} → Txn(no compares, Then Put(a) Put(b) Put(c))
+;;   :cas   [{:a old :b old :c old} {:a new :b new :c new}]
+;;            → Txn(If k.value==old for every k, Then Put(k, new) for every k)
+;;
+;; CAS commits all three Put ops in one WAL entry on the leader (single revision)
+;; or none of them. Knossos' multi-register model checks linearizability
+;; per-key; the atomic Txn ensures the three keys move together so no
+;; per-key reordering is possible across a successful CAS.
+
+(def ^:private multi-keys [:a :b :c])
+(def ^:private multi-key-prefix "/jepsen/multi/")
+
+(defn- multi-key-name [k] (str multi-key-prefix (name k)))
+
+(defn- get-value
+  "Returns the long value at key, or nil if absent."
+  [kv key-str]
+  (let [resp (-> (.get kv (->bs key-str))
+                 (.get timeout-ms TimeUnit/MILLISECONDS))]
+    (when (pos? (.getCount resp))
+      (-> resp .getKvs first .getValue bs-> Long/parseLong))))
+
+(defn do-multi-read
+  "Reads all three keys and returns {:a v :b v :c v} (nil for absent)."
+  [kv]
+  (reduce (fn [m k] (assoc m k (get-value kv (multi-key-name k))))
+          {}
+          multi-keys))
+
+(defn do-multi-write
+  "Atomic multi-key blind write. values is a {:a v :b v :c v} map (all keys
+  required). Issued as a single Txn with no compares so all puts share a
+  revision."
+  [kv values]
+  (let [puts (for [k multi-keys]
+               (Op/put (->bs (multi-key-name k))
+                       (->bs (get values k))
+                       (PutOption/DEFAULT)))
+        txn  (-> (.txn kv)
+                 (.If    (into-array Cmp []))
+                 (.Then  (into-array Op puts))
+                 (.Else  (into-array Op []))
+                 (.commit)
+                 (.get timeout-ms TimeUnit/MILLISECONDS))]
+    (when-not (.isSucceeded txn)
+      (throw (ex-info "multi-write txn unexpectedly failed (no compares)" {})))
+    :ok))
+
+(defn do-multi-cas
+  "Multi-key CAS: succeed only if every key's current value equals old[k],
+  in which case all keys are atomically swapped to new[k]. Returns true on
+  success, false on a value mismatch."
+  [kv old new]
+  (let [cmps (for [k multi-keys]
+               (Cmp. (->bs (multi-key-name k))
+                     Cmp$Op/EQUAL
+                     (CmpTarget/value (->bs (get old k)))))
+        puts (for [k multi-keys]
+               (Op/put (->bs (multi-key-name k))
+                       (->bs (get new k))
+                       (PutOption/DEFAULT)))
+        txn  (-> (.txn kv)
+                 (.If    (into-array Cmp cmps))
+                 (.Then  (into-array Op  puts))
+                 (.Else  (into-array Op  []))
+                 (.commit)
+                 (.get timeout-ms TimeUnit/MILLISECONDS))]
+    (.isSucceeded txn)))
+
+(defrecord MultiRegisterClient [^Client conn kv]
+  client/Client
+
+  (open! [this test node]
+    (let [c (connect! node)]
+      (assoc this :conn c :kv (.getKVClient c))))
+
+  (setup! [this test])
+
+  (invoke! [this test op]
+    (try
+      (case (:f op)
+        :read  (assoc op :type :ok :value (do-multi-read kv))
+        :write (do (do-multi-write kv (:value op))
+                   (assoc op :type :ok))
+        :cas   (let [[old new] (:value op)
+                     swapped?  (do-multi-cas kv old new)]
+                 (assoc op :type (if swapped? :ok :fail))))
+
+      (catch TimeoutException _
+        (assoc op :type :info :error :timeout))
+
+      (catch io.grpc.StatusRuntimeException e
+        (assoc op :type :fail :error (str (.getStatus e))))
+
+      (catch Exception e
+        (assoc op :type :fail :error (.getMessage e)))))
+
+  (teardown! [this test])
+
+  (close! [this test]
+    (when kv   (.close kv))
+    (when conn (.close conn))))
+
+(defn multi-register-client []
+  (map->MultiRegisterClient {}))
