@@ -7,9 +7,17 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+
+ARG VERSION=dev
+ARG COMMIT=
+ARG DATE=
+
 RUN CGO_ENABLED=0 GOOS=linux go build \
       -trimpath \
-      -ldflags="-s -w" \
+      -ldflags="-s -w \
+        -X github.com/t4db/t4/internal/version.Version=${VERSION} \
+        -X github.com/t4db/t4/internal/version.Commit=${COMMIT} \
+        -X github.com/t4db/t4/internal/version.Date=${DATE}" \
       -o /t4 \
       ./cmd/t4
 
