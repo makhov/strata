@@ -783,6 +783,20 @@ See [api.md — Point-in-time restore](api.md#point-in-time-restore-s3-versionin
 # Find the current checkpoint key.
 aws s3 cp s3://my-bucket/source-prefix/manifest/latest - | jq .
 
+# Download that checkpoint index and record version IDs for the index,
+# every listed sst_files object, and every checkpoint-local pebble_meta file.
+aws s3api list-object-versions \
+  --bucket my-bucket \
+  --prefix source-prefix/checkpoint/ \
+  --query 'Versions[?IsLatest==`true`].[Key,VersionId]' \
+  --output json
+
+aws s3api list-object-versions \
+  --bucket my-bucket \
+  --prefix source-prefix/sst/ \
+  --query 'Versions[?IsLatest==`true`].[Key,VersionId]' \
+  --output json
+
 # List WAL segments and their version IDs.
 aws s3api list-object-versions \
   --bucket my-bucket \
@@ -790,3 +804,6 @@ aws s3api list-object-versions \
   --query 'Versions[?IsLatest==`true`].[Key,VersionId]' \
   --output json
 ```
+
+The checkpoint index alone is not a complete restore point. Include the versions for all SST and Pebble metadata objects
+referenced by the index, otherwise source checkpoint GC can delete live metadata before the restore runs.

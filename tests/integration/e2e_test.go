@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -386,6 +387,27 @@ func TestRestorePoint(t *testing.T) {
 	if err != nil || manifest == nil {
 		t.Fatalf("ReadManifest: err=%v manifest=%v", err, manifest)
 	}
+	idx, err := checkpoint.New(nil).ReadCheckpointIndex(ctx, store, manifest.CheckpointKey)
+	if err != nil {
+		t.Fatalf("ReadCheckpointIndex: %v", err)
+	}
+	checkpointFiles := make([]t4.PinnedObject, 0, len(idx.SSTFiles)+len(idx.PebbleMeta))
+	for _, key := range idx.SSTFiles {
+		ver := store.versionOf(key)
+		if ver == "" {
+			t.Fatalf("missing version for checkpoint SST %q", key)
+		}
+		checkpointFiles = append(checkpointFiles, t4.PinnedObject{Key: key, VersionID: ver})
+	}
+	metaPrefix := strings.TrimSuffix(manifest.CheckpointKey, "manifest.json")
+	for _, name := range idx.PebbleMeta {
+		key := metaPrefix + name
+		ver := store.versionOf(key)
+		if ver == "" {
+			t.Fatalf("missing version for checkpoint meta %q", key)
+		}
+		checkpointFiles = append(checkpointFiles, t4.PinnedObject{Key: key, VersionID: ver})
+	}
 	walKeys, err := store.List(ctx, "wal/")
 	if err != nil {
 		t.Fatalf("List wal: %v", err)
@@ -399,6 +421,7 @@ func TestRestorePoint(t *testing.T) {
 	rp := &t4.RestorePoint{
 		Store:             store,
 		CheckpointArchive: t4.PinnedObject{Key: manifest.CheckpointKey, VersionID: store.versionOf(manifest.CheckpointKey)},
+		CheckpointFiles:   checkpointFiles,
 		WALSegments:       walSegs,
 	}
 

@@ -514,8 +514,8 @@ func TestWriteRestoreMultiple(t *testing.T) {
 }
 
 // TestRestoreVersioned verifies that RestoreVersioned can restore a checkpoint
-// using a pinned version of the index key even after the index has been deleted
-// (e.g. GC'd), as long as SSTs and pebble meta are still present.
+// using pinned object versions even after checkpoint GC has deleted the live
+// index, SST, and Pebble metadata objects.
 func TestRestoreVersioned(t *testing.T) {
 	db := openDB(t)
 	store := newVersionedMem()
@@ -530,10 +530,35 @@ func TestRestoreVersioned(t *testing.T) {
 	if pinnedVer == "" {
 		t.Fatal("no version captured for index key")
 	}
+	idx, err := testCP.ReadCheckpointIndex(ctx, store, indexKey)
+	if err != nil {
+		t.Fatalf("ReadCheckpointIndex: %v", err)
+	}
+	pinnedFiles := make(map[string]string)
+	var deleted []string
+	deleted = append(deleted, indexKey)
+	for _, key := range idx.SSTFiles {
+		ver := store.VersionOf(key)
+		if ver == "" {
+			t.Fatalf("no version captured for sst %q", key)
+		}
+		pinnedFiles[key] = ver
+		deleted = append(deleted, key)
+	}
+	metaPrefix := strings.TrimSuffix(indexKey, "manifest.json")
+	for _, name := range idx.PebbleMeta {
+		key := metaPrefix + name
+		ver := store.VersionOf(key)
+		if ver == "" {
+			t.Fatalf("no version captured for meta %q", key)
+		}
+		pinnedFiles[key] = ver
+		deleted = append(deleted, key)
+	}
 
-	// Delete just the index (simulating GC); SSTs and pebble meta stay.
-	if err := store.Delete(ctx, indexKey); err != nil {
-		t.Fatalf("delete index: %v", err)
+	// Delete the live checkpoint objects (simulating GC).
+	if err := store.DeleteMany(ctx, deleted); err != nil {
+		t.Fatalf("delete checkpoint objects: %v", err)
 	}
 
 	// Regular Restore should fail (index not found).
@@ -543,7 +568,7 @@ func TestRestoreVersioned(t *testing.T) {
 
 	// RestoreVersioned with the pinned version should succeed.
 	dir := t.TempDir()
-	term, rev, err := testCP.RestoreVersioned(ctx, store, indexKey, pinnedVer, dir)
+	term, rev, err := testCP.RestoreVersioned(ctx, store, indexKey, pinnedVer, pinnedFiles, dir)
 	if err != nil {
 		t.Fatalf("RestoreVersioned: %v", err)
 	}

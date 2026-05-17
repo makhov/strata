@@ -23,7 +23,6 @@ type PinnedObject struct {
 //
 // S3 versioning must be enabled on the source bucket.
 type RestorePoint struct {
-
 	// Store is the versioned object store to read pinned objects from.
 	// It may use a different prefix than Config.ObjectStore (e.g. to read
 	// from the source branch while writing to a new branch prefix).
@@ -31,6 +30,12 @@ type RestorePoint struct {
 
 	// CheckpointArchive is the pinned checkpoint archive object.
 	CheckpointArchive PinnedObject
+
+	// CheckpointFiles are the pinned SST and Pebble metadata objects referenced
+	// by CheckpointArchive. Supplying them makes restore independent of source
+	// checkpoint GC. If omitted, T4 falls back to reading those objects from
+	// the live store for compatibility with older callers.
+	CheckpointFiles []PinnedObject
 
 	// WALSegments are the WAL segments to replay after the checkpoint,
 	// in ascending sequence order.

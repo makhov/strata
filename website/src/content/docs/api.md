@@ -280,6 +280,10 @@ type RestorePoint struct {
     // restored and WALSegments are replayed into a fresh database.
     CheckpointArchive PinnedObject
 
+    // SST and Pebble metadata objects referenced by CheckpointArchive.
+    // Include these to make restore independent of checkpoint GC.
+    CheckpointFiles []PinnedObject
+
     // WAL segments to replay after the checkpoint, in ascending sequence order.
     WALSegments []PinnedObject
 }
@@ -294,6 +298,10 @@ node, err := t4.Open(t4.Config{
     RestorePoint: &t4.RestorePoint{
         Store:             sourceStore,
         CheckpointArchive: t4.PinnedObject{Key: "...", VersionID: "..."},
+        CheckpointFiles: []t4.PinnedObject{
+            {Key: "sst/abc/000123.sst", VersionID: "..."},
+            {Key: "checkpoint/0001/.../000004.log", VersionID: "..."},
+        },
         WALSegments: []t4.PinnedObject{
             {Key: "wal/000042.seg", VersionID: "..."},
         },
@@ -311,6 +319,10 @@ type VersionedStore interface {
 ```
 
 `object.S3Store` satisfies this interface. S3 versioning must be enabled on the source bucket.
+
+When capturing a restore point, pin the checkpoint index, every SST and Pebble metadata object listed in that index, and
+all WAL segments to replay after the checkpoint. Pinning only the checkpoint index is not enough: source checkpoint GC
+may delete the live metadata objects before the restore runs.
 
 ---
 
