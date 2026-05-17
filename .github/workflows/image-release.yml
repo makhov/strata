@@ -66,6 +66,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Stamp build date
+        id: stamp
+        run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push tagged image
         uses: docker/build-push-action@v6
         with:
@@ -75,6 +79,10 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:${{ needs.release.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.release.outputs.tag_name }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ steps.stamp.outputs.date }}
 
   build-binaries:
     name: Build binaries (${{ matrix.goos }}/${{ matrix.goarch }})
@@ -106,11 +114,16 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
         run: |
           mkdir -p dist
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           go build \
             -trimpath \
-            -ldflags="-s -w" \
+            -ldflags="-s -w \
+              -X github.com/t4db/t4/internal/version.Version=${TAG_NAME} \
+              -X github.com/t4db/t4/internal/version.Commit=${GITHUB_SHA} \
+              -X github.com/t4db/t4/internal/version.Date=${DATE}" \
             -o "dist/t4-${GOOS}-${GOARCH}" \
             ./cmd/t4
 

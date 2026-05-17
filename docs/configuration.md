@@ -339,6 +339,7 @@ Generated from the CLI flag definitions in Go. Run `go run ./hack/docgen` after 
 | `t4 status` | `--s3-profile` | — | `T4_S3_PROFILE` | No | named AWS shared config profile to use; t4 only enables the AWS shared config chain when this is set (use 'default' to opt in to the default profile) |
 | `t4 status` | `--s3-region` | — | `T4_S3_REGION` | No | AWS region |
 | `t4 status` | `--s3-secret-access-key` | — | `T4_S3_SECRET_ACCESS_KEY` | No | AWS secret access key |
+| `t4 version` | `--short` | `false` | — | No | Print only the version string |
 <!-- END GENERATED: cli-flags -->
 
 ---
