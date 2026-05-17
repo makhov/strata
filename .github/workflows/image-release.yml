@@ -8,11 +8,62 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write
+  attestations: write
 
 jobs:
+  precheck:
+    name: Verify CI green on release SHA
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Wait for CI success on ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            run=$(gh run list \
+              --repo "$REPO" \
+              --workflow ci.yml \
+              --commit "$SHA" \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0]')
+            if [[ -z "$run" || "$run" == "null" ]]; then
+              echo "No CI run for $SHA yet, waiting..."
+              sleep 30
+              continue
+            fi
+            status=$(echo "$run" | jq -r .status)
+            conclusion=$(echo "$run" | jq -r .conclusion)
+            if [[ "$status" == "completed" ]]; then
+              if [[ "$conclusion" == "success" ]]; then
+                echo "CI success on $SHA"
+                exit 0
+              fi
+              echo "CI conclusion=$conclusion on $SHA — refuse release" >&2
+              exit 1
+            fi
+            echo "CI status=$status on $SHA, waiting..."
+            sleep 30
+          done
+          echo "Timed out waiting for CI on $SHA" >&2
+          exit 1
+
+  jepsen:
+    name: Jepsen (release)
+    needs: precheck
+    uses: ./.github/workflows/jepsen-workflow.yml
+    with:
+      nemeses: '["partition-halves", "kill", "partition-minio"]'
+
   release:
     name: Create draft release
     runs-on: ubuntu-latest
+    needs: precheck
     outputs:
       tag_name: ${{ steps.tag.outputs.tag_name }}
       image_tag: ${{ steps.image_tag.outputs.image_tag }}
@@ -53,6 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - release
+      - jepsen
     steps:
       - uses: actions/checkout@v4
 
@@ -66,11 +118,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Stamp build date
         id: stamp
         run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push tagged image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -79,16 +135,31 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:${{ needs.release.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
           build-args: |
             VERSION=${{ needs.release.outputs.tag_name }}
             COMMIT=${{ github.sha }}
             DATE=${{ steps.stamp.outputs.date }}
+
+      - name: Sign image (cosign keyless)
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE"
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   build-binaries:
     name: Build binaries (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
     needs:
       - release
+      - jepsen
     strategy:
       fail-fast: false
       matrix:
@@ -127,6 +198,11 @@ jobs:
             -o "dist/t4-${GOOS}-${GOARCH}" \
             ./cmd/t4
 
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/t4-${{ matrix.goos }}-${{ matrix.goarch }}
+
       - name: Upload binary to draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -150,6 +226,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Download binary artifacts
         uses: actions/download-artifact@v4
         with:
@@ -162,9 +241,21 @@ jobs:
           cd dist
           sha256sum t4-* > checksums.txt
 
-      - name: Upload checksums to draft release
+      - name: Sign checksums (cosign keyless)
+        run: |
+          cd dist
+          cosign sign-blob --yes \
+            --output-signature checksums.txt.sig \
+            --output-certificate checksums.txt.pem \
+            checksums.txt
+
+      - name: Upload checksums and signature to draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.release.outputs.tag_name }}
         run: |
-          gh release upload "$TAG_NAME" ./dist/checksums.txt --clobber
+          gh release upload "$TAG_NAME" \
+            ./dist/checksums.txt \
+            ./dist/checksums.txt.sig \
+            ./dist/checksums.txt.pem \
+            --clobber

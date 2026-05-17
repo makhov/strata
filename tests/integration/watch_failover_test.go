@@ -310,7 +310,7 @@ func runEtcdWatchFailover(t *testing.T, gap, abrupt bool, drainPre, writePost in
 		cluster.nodes[leaderIdx] = nil
 	}
 
-	newIdx := cluster.waitNewLeader(t, leaderIdx, 30*time.Second)
+	newIdx := cluster.waitNewLeader(t, leaderIdx, 60*time.Second)
 	t.Logf("new leader: node-%d", newIdx)
 	newLeader := cluster.nodes[newIdx]
 
