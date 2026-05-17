@@ -252,10 +252,14 @@ func Open(cfg Config) (*Node, error) {
 			rp := cfg.RestorePoint
 			if rp.CheckpointArchive.Key != "" {
 				checkpointFiles := make(map[string]string, len(rp.CheckpointFiles))
-				for _, obj := range rp.CheckpointFiles {
-					if obj.Key != "" && obj.VersionID != "" {
-						checkpointFiles[obj.Key] = obj.VersionID
+				for i, obj := range rp.CheckpointFiles {
+					if obj.Key == "" || obj.VersionID == "" {
+						return nil, fmt.Errorf("t4: RestorePoint.CheckpointFiles[%d] has empty Key or VersionID (%+v); pin every referenced object or omit CheckpointFiles entirely", i, obj)
 					}
+					if existing, dup := checkpointFiles[obj.Key]; dup && existing != obj.VersionID {
+						return nil, fmt.Errorf("t4: RestorePoint.CheckpointFiles has conflicting versions for key %q: %q and %q", obj.Key, existing, obj.VersionID)
+					}
+					checkpointFiles[obj.Key] = obj.VersionID
 				}
 				t, rev, err := cp.RestoreVersioned(ctx, rp.Store,
 					rp.CheckpointArchive.Key, rp.CheckpointArchive.VersionID, checkpointFiles, pebbleDir)

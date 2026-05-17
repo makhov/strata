@@ -424,6 +424,9 @@ func (mgr *Manager) RestoreBranch(ctx context.Context, store object.Store, ances
 // restoreFromIndex restores a v2 checkpoint from its CheckpointIndex.
 // ancestorStore is used for AncestorSSTFiles; if nil, store is used for all.
 func restoreFromIndex(ctx context.Context, mgr *Manager, store object.Store, ancestorStore object.Store, indexKey, targetDir string) (uint64, int64, error) {
+	if !strings.HasSuffix(indexKey, "manifest.json") {
+		return 0, 0, fmt.Errorf("checkpoint: index key %q must end with \"manifest.json\"", indexKey)
+	}
 	idx, err := mgr.ReadCheckpointIndex(ctx, store, indexKey)
 	if err != nil {
 		return 0, 0, fmt.Errorf("checkpoint: read index %q: %w", indexKey, err)
@@ -460,11 +463,22 @@ func restoreFromIndex(ctx context.Context, mgr *Manager, store object.Store, anc
 }
 
 // RestoreVersioned downloads a pinned version of a checkpoint index and
-// restores it to targetDir. checkpointFileVersions may pin SST and Pebble meta
-// object versions referenced by the index. If an object is not present in the
-// map, RestoreVersioned falls back to reading the live object for compatibility
-// with older callers that captured only the index version.
+// restores it to targetDir. checkpointFileVersions pins SST and Pebble meta
+// object versions referenced by the index.
+//
+// If checkpointFileVersions is non-empty, RestoreVersioned runs in strict
+// mode: every SST and Pebble meta key referenced by the index must be
+// present in the map, otherwise restore fails before any download. This
+// surfaces caller bugs (typos, stale enumeration) instead of silently
+// falling through to a live read of a possibly-GC'd object.
+//
+// If checkpointFileVersions is empty, RestoreVersioned reads SSTs and meta
+// from the live store. This is the legacy path for callers that captured
+// only the index version; it is unsafe against source checkpoint GC.
 func (mgr *Manager) RestoreVersioned(ctx context.Context, store object.VersionedStore, objKey, versionID string, checkpointFileVersions map[string]string, targetDir string) (term uint64, revision int64, err error) {
+	if !strings.HasSuffix(objKey, "manifest.json") {
+		return 0, 0, fmt.Errorf("checkpoint: index key %q must end with \"manifest.json\"", objKey)
+	}
 	rc, err := store.GetVersioned(ctx, objKey, versionID)
 	if err != nil {
 		return 0, 0, fmt.Errorf("checkpoint: download versioned %q@%s: %w", objKey, versionID, err)
@@ -475,6 +489,20 @@ func (mgr *Manager) RestoreVersioned(ctx context.Context, store object.Versioned
 	if decErr != nil {
 		return 0, 0, fmt.Errorf("checkpoint: decode versioned index %q: %w", objKey, decErr)
 	}
+	metaPrefix := strings.TrimSuffix(objKey, "manifest.json")
+	if len(checkpointFileVersions) > 0 {
+		for _, sstKey := range idx.SSTFiles {
+			if _, ok := checkpointFileVersions[sstKey]; !ok {
+				return 0, 0, fmt.Errorf("checkpoint: pinned versions missing SST %q referenced by index %q (strict mode: pin every referenced key or pass an empty map for legacy live reads)", sstKey, objKey)
+			}
+		}
+		for _, name := range idx.PebbleMeta {
+			key := metaPrefix + name
+			if _, ok := checkpointFileVersions[key]; !ok {
+				return 0, 0, fmt.Errorf("checkpoint: pinned versions missing Pebble meta %q referenced by index %q (strict mode: pin every referenced key or pass an empty map for legacy live reads)", key, objKey)
+			}
+		}
+	}
 	if err := os.MkdirAll(targetDir, 0o700); err != nil {
 		return 0, 0, err
 	}
@@ -484,7 +512,6 @@ func (mgr *Manager) RestoreVersioned(ctx context.Context, store object.Versioned
 			return 0, 0, fmt.Errorf("checkpoint: download versioned sst %q: %w", sstKey, err)
 		}
 	}
-	metaPrefix := strings.TrimSuffix(objKey, "manifest.json")
 	for _, name := range idx.PebbleMeta {
 		key := metaPrefix + name
 		if err := downloadVersionedOrLive(ctx, store, key, checkpointFileVersions, filepath.Join(targetDir, name)); err != nil {
@@ -521,12 +548,12 @@ func downloadFile(ctx context.Context, store object.Store, key, dest string) err
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, err = io.Copy(f, rc)
 	return err
 }
@@ -537,12 +564,12 @@ func downloadVersionedOrLive(ctx context.Context, store object.VersionedStore, k
 		if err != nil {
 			return err
 		}
-		defer rc.Close()
+		defer func() { _ = rc.Close() }()
 		f, err := os.Create(dest)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		_, err = io.Copy(f, rc)
 		return err
 	}
